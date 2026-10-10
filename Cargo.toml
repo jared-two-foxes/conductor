@@ -1,0 +1,18 @@
+[package]
+name = "conductor"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic execution, verification, and review coordinator"
+license = "GPL-3.0-only"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+executor = { git = "https://github.com/jared-two-foxes/executor" }
+review-app = { git = "https://github.com/jared-two-foxes/review", rev = "797f268313b70bd5a03334e918a50d01e31b6ca7" }
+review-protocol = { git = "https://github.com/jared-two-foxes/review", rev = "797f268313b70bd5a03334e918a50d01e31b6ca7" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+git2 = { version = "0.20", default-features = false }
+tempfile = "3"
