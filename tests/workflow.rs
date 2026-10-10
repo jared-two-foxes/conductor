@@ -1,12 +1,14 @@
-use conductor::{
-    ReviewDecision, ReviewEvaluation, Status, WorkflowRequest, run_with_reviewer,
-};
+use conductor::{ReviewDecision, ReviewEvaluation, Status, WorkflowRequest, run_with_reviewer};
 use git2::Repository;
 use serde_json::json;
 use std::fs;
 use tempfile::tempdir;
 
-fn request(root: &std::path::Path, operations: serde_json::Value, checks: serde_json::Value) -> WorkflowRequest {
+fn request(
+    root: &std::path::Path,
+    operations: serde_json::Value,
+    checks: serde_json::Value,
+) -> WorkflowRequest {
     serde_json::from_value(json!({
         "schema": "conductor.request/v1",
         "repository_path": root,
@@ -37,8 +39,14 @@ fn applies_checks_and_reviews_in_order() {
     let result = run_with_reviewer(&input, |review, _config| {
         assert_eq!(review.head_ref, ":working");
         assert_eq!(review.base_ref, "HEAD");
-        assert_eq!(review.requirements.as_deref(), Some("Create the requested file"));
-        assert_eq!(fs::read_to_string(dir.path().join("created.txt")).unwrap(), "hello");
+        assert_eq!(
+            review.requirements.as_deref(),
+            Some("Create the requested file")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("created.txt")).unwrap(),
+            "hello"
+        );
         approved()
     });
     assert_eq!(result.status, Status::Passed);
@@ -64,7 +72,10 @@ fn executor_failure_returns_to_design_without_checks_or_review() {
     assert_eq!(result.phase, "execution");
     assert_eq!(result.execution.unwrap().operations_applied, 1);
     assert!(result.checks.is_empty());
-    assert_eq!(fs::read_to_string(dir.path().join("created.txt")).unwrap(), "hello");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("created.txt")).unwrap(),
+        "hello"
+    );
 }
 
 #[test]
@@ -123,7 +134,10 @@ fn unavailable_review_is_blocked() {
         error: Some("No review provider configured".into()),
     });
     assert_eq!(result.status, Status::Blocked);
-    assert_eq!(result.error.as_deref(), Some("No review provider configured"));
+    assert_eq!(
+        result.error.as_deref(),
+        Some("No review provider configured")
+    );
 }
 
 #[test]

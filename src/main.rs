@@ -31,7 +31,9 @@ fn main() -> ExitCode {
     let outcome = match bytes {
         Ok(bytes) => match serde_json::from_slice::<WorkflowRequest>(&bytes) {
             Ok(request) => run(&request),
-            Err(error) => WorkflowResult::blocked("input", format!("Invalid request JSON: {error}")),
+            Err(error) => {
+                WorkflowResult::blocked("input", format!("Invalid request JSON: {error}"))
+            }
         },
         Err(error) => WorkflowResult::blocked("input", format!("Cannot read request: {error}")),
     };

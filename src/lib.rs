@@ -166,7 +166,11 @@ where
     let review_request = ReviewRequest {
         schema: "review.request/v1".to_owned(),
         repository_path: request.repository_path.to_string_lossy().into_owned(),
-        base_ref: request.review.base_ref.clone().unwrap_or_else(|| "HEAD".into()),
+        base_ref: request
+            .review
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| "HEAD".into()),
         head_ref: ":working".into(),
         requirements: Some(request.review.requirements.clone()),
     };
