@@ -11,6 +11,7 @@ use std::process::Command;
 use std::time::Duration;
 
 const MAX_OUTPUT_CHARS: usize = 16_384;
+const WALL_CLOCK_BUDGET_CAP_SECS: u64 = 600;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +74,16 @@ pub struct CheckResult {
     pub stderr: String,
 }
 
+/// Reports the review budget applied by Conductor, including the
+/// changed-file count used to derive scaled defaults.
+#[derive(Serialize)]
+pub struct ReviewBudget {
+    pub changed_files: u32,
+    pub max_turns: u32,
+    pub max_tool_calls: u32,
+    pub wall_clock_budget_secs: u64,
+}
+
 #[derive(Serialize)]
 pub struct WorkflowResult {
     pub schema: &'static str,
@@ -83,6 +94,8 @@ pub struct WorkflowResult {
     pub checks: Vec<CheckResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_budget: Option<ReviewBudget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -96,6 +109,7 @@ impl WorkflowResult {
             execution: None,
             checks: Vec::new(),
             review: None,
+            review_budget: None,
             error: None,
         }
     }
@@ -184,28 +198,6 @@ where
         return WorkflowResult::blocked("input", error);
     }
 
-    let mut config = ReviewConfig::default();
-    if let Some(model) = &request.review.model {
-        config.model = model.clone();
-    }
-    config.provider_root = request.review.provider_root.clone();
-    if let Some(max_turns) = request.review.max_turns {
-        config.max_turns = max_turns;
-    }
-    if let Some(max_tool_calls) = request.review.max_tool_calls {
-        config.max_tool_calls = max_tool_calls;
-    }
-    if let Some(secs) = request.review.wall_clock_budget_secs {
-        config.wall_clock_budget = Some(Duration::from_secs(secs));
-    }
-    config.max_cost_usd = request.review.max_cost_usd;
-    if let Some(max_repeated_actions) = request.review.max_repeated_actions {
-        config.max_repeated_actions = max_repeated_actions;
-    }
-    if let Some(max_completion_attempts) = request.review.max_completion_attempts {
-        config.max_completion_attempts = max_completion_attempts;
-    }
-
     let mut output = WorkflowResult::new(Status::Blocked, "execution");
     let applied = executor::apply(&request.repository_path, &request.execution);
     let success = applied.success;
@@ -248,6 +240,14 @@ where
     }
 
     output.phase = "review";
+    let changed_files = count_changed_files(&request.repository_path, &review_request.base_ref);
+    let config = build_review_config(&request.review, changed_files);
+    output.review_budget = Some(ReviewBudget {
+        changed_files,
+        max_turns: config.max_turns,
+        max_tool_calls: config.max_tool_calls,
+        wall_clock_budget_secs: config.wall_clock_budget.map(|d| d.as_secs()).unwrap_or(0),
+    });
     let evaluation = reviewer(&review_request, &config);
     output.review = evaluation.result;
     output.error = evaluation.error;
@@ -257,6 +257,76 @@ where
         ReviewDecision::Approved | ReviewDecision::Indeterminate => Status::Blocked,
     };
     output
+}
+
+/// Build the review configuration, scaling omitted limit fields from the
+/// actual post-apply changed-file count.
+fn build_review_config(settings: &ReviewSettings, changed_files: u32) -> ReviewConfig {
+    let mut config = ReviewConfig::default();
+    if let Some(model) = &settings.model {
+        config.model = model.clone();
+    }
+    config.provider_root = settings.provider_root.clone();
+
+    config.max_turns = settings.max_turns.unwrap_or_else(|| {
+        let scaled = 8u32.saturating_add(changed_files.saturating_mul(2));
+        scaled.max(10)
+    });
+    config.max_tool_calls = settings.max_tool_calls.unwrap_or_else(|| {
+        let scaled = 12u32.saturating_add(changed_files.saturating_mul(3));
+        scaled.max(20)
+    });
+    let wall_secs = settings.wall_clock_budget_secs.unwrap_or_else(|| {
+        let scaled = 30u32.saturating_add(changed_files.saturating_mul(8));
+        (scaled.max(60) as u64).min(WALL_CLOCK_BUDGET_CAP_SECS)
+    });
+    config.wall_clock_budget = Some(Duration::from_secs(wall_secs));
+
+    config.max_cost_usd = settings.max_cost_usd;
+    if let Some(max_repeated_actions) = settings.max_repeated_actions {
+        config.max_repeated_actions = max_repeated_actions;
+    }
+    if let Some(max_completion_attempts) = settings.max_completion_attempts {
+        config.max_completion_attempts = max_completion_attempts;
+    }
+    config
+}
+
+/// Count the number of changed files in the post-apply working-tree diff
+/// against `base_ref`. Includes both tracked changes (modified, deleted) and
+/// untracked files (newly created), matching review-cli's diff computation.
+/// Returns 0 if git is unavailable or either command fails.
+fn count_changed_files(repo_path: &std::path::Path, base_ref: &str) -> u32 {
+    let tracked = Command::new("git")
+        .args(["diff", "--name-only", "-z", base_ref, "--"])
+        .current_dir(repo_path)
+        .output();
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(repo_path)
+        .output();
+
+    let tracked_stdout = match tracked {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return 0,
+    };
+    let untracked_stdout = match untracked {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return 0,
+    };
+
+    let mut paths: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for chunk in tracked_stdout.split(|&b| b == 0) {
+        if !chunk.is_empty() {
+            paths.insert(chunk.to_vec());
+        }
+    }
+    for chunk in untracked_stdout.split(|&b| b == 0) {
+        if !chunk.is_empty() {
+            paths.insert(chunk.to_vec());
+        }
+    }
+    paths.len().try_into().unwrap_or(u32::MAX)
 }
 
 fn bounded(bytes: &[u8]) -> String {
