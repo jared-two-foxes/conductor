@@ -154,3 +154,67 @@ fn rejects_invalid_schema_before_applying_changes() {
     assert_eq!(result.status, Status::Blocked);
     assert!(!dir.path().join("created.txt").exists());
 }
+
+#[test]
+fn forwards_max_repeated_actions_and_completion_attempts_to_review_config() {
+    let dir = tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let input: WorkflowRequest = serde_json::from_value(json!({
+        "schema": "conductor.request/v1",
+        "repository_path": dir.path(),
+        "execution": { "operations": [] },
+        "checks": [],
+        "review": {
+            "requirements": "Create the requested file",
+            "max_repeated_actions": 7,
+            "max_completion_attempts": 5
+        }
+    }))
+    .unwrap();
+    let result = run_with_reviewer(&input, |_, config| {
+        assert_eq!(config.max_repeated_actions, 7);
+        assert_eq!(config.max_completion_attempts, 5);
+        approved()
+    });
+    assert_eq!(result.status, Status::Passed);
+}
+
+#[test]
+fn rejects_zero_max_repeated_actions() {
+    let dir = tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let input: WorkflowRequest = serde_json::from_value(json!({
+        "schema": "conductor.request/v1",
+        "repository_path": dir.path(),
+        "execution": { "operations": [] },
+        "checks": [],
+        "review": {
+            "requirements": "Create the requested file",
+            "max_repeated_actions": 0
+        }
+    }))
+    .unwrap();
+    let result = run_with_reviewer(&input, |_, _| panic!("review must not run"));
+    assert_eq!(result.status, Status::Blocked);
+    assert_eq!(result.phase, "input");
+}
+
+#[test]
+fn rejects_zero_max_completion_attempts() {
+    let dir = tempdir().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let input: WorkflowRequest = serde_json::from_value(json!({
+        "schema": "conductor.request/v1",
+        "repository_path": dir.path(),
+        "execution": { "operations": [] },
+        "checks": [],
+        "review": {
+            "requirements": "Create the requested file",
+            "max_completion_attempts": 0
+        }
+    }))
+    .unwrap();
+    let result = run_with_reviewer(&input, |_, _| panic!("review must not run"));
+    assert_eq!(result.status, Status::Blocked);
+    assert_eq!(result.phase, "input");
+}

@@ -50,6 +50,10 @@ pub struct ReviewSettings {
     pub wall_clock_budget_secs: Option<u64>,
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub max_repeated_actions: Option<u32>,
+    #[serde(default)]
+    pub max_completion_attempts: Option<u32>,
 }
 
 #[derive(Serialize, PartialEq, Eq, Debug)]
@@ -155,6 +159,8 @@ where
     if request.review.max_turns == Some(0)
         || request.review.max_tool_calls == Some(0)
         || request.review.wall_clock_budget_secs == Some(0)
+        || request.review.max_repeated_actions == Some(0)
+        || request.review.max_completion_attempts == Some(0)
         || request
             .review
             .max_cost_usd
@@ -193,6 +199,12 @@ where
         config.wall_clock_budget = Some(Duration::from_secs(secs));
     }
     config.max_cost_usd = request.review.max_cost_usd;
+    if let Some(max_repeated_actions) = request.review.max_repeated_actions {
+        config.max_repeated_actions = max_repeated_actions;
+    }
+    if let Some(max_completion_attempts) = request.review.max_completion_attempts {
+        config.max_completion_attempts = max_completion_attempts;
+    }
 
     let mut output = WorkflowResult::new(Status::Blocked, "execution");
     let applied = executor::apply(&request.repository_path, &request.execution);
