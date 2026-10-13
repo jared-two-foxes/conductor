@@ -375,3 +375,93 @@ fn returns_zero_when_git_diff_fails() {
     // even though untracked files exist.
     assert_eq!(budget.changed_files, 0);
 }
+
+#[test]
+fn writes_ledger_by_default() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    let input = request(dir.path(), create_file_operations(1), json!([]));
+    let result = run_with_reviewer(&input, |_, config| {
+        let ledger_path = config
+            .ledger_path
+            .as_ref()
+            .expect("ledger_path should be set");
+        assert!(ledger_path.ends_with(".conductor/ledger.jsonl"));
+        approved()
+    });
+    assert_eq!(result.status, Status::Passed);
+    let ledger_path = result
+        .ledger_path
+        .as_ref()
+        .expect("ledger_path should be in result");
+    assert!(ledger_path.ends_with(".conductor/ledger.jsonl"));
+    assert!(dir.path().join(".conductor").exists());
+    let exclude = fs::read_to_string(dir.path().join(".git").join("info").join("exclude")).unwrap();
+    assert!(exclude.lines().any(|l| l.trim() == ".conductor/"));
+}
+
+#[test]
+fn disables_ledger_when_requested() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    let input: WorkflowRequest = serde_json::from_value(json!({
+        "schema": "conductor.request/v1",
+        "repository_path": dir.path(),
+        "execution": { "operations": [] },
+        "checks": [],
+        "review": {
+            "requirements": "Create the requested file",
+            "ledger": false
+        }
+    }))
+    .unwrap();
+    let result = run_with_reviewer(&input, |_, config| {
+        assert!(config.ledger_path.is_none());
+        approved()
+    });
+    assert_eq!(result.status, Status::Passed);
+    assert!(result.ledger_path.is_none());
+}
+
+#[test]
+fn ledger_dir_excluded_from_changed_file_count() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    // First run creates .conductor/ and adds it to .git/info/exclude
+    let input = request(dir.path(), create_file_operations(1), json!([]));
+    let result = run_with_reviewer(&input, |_, _| approved());
+    assert_eq!(result.status, Status::Passed);
+    // Simulate the ledger file that the real review would write
+    fs::write(dir.path().join(".conductor").join("ledger.jsonl"), "{}\n").unwrap();
+    // Second run: .conductor/ledger.jsonl should NOT be counted
+    let input2 = request(
+        dir.path(),
+        json!([{"type": "create_file", "path": "file_1.txt", "content": "y"}]),
+        json!([]),
+    );
+    let result2 = run_with_reviewer(&input2, |_, _| approved());
+    assert_eq!(result2.status, Status::Passed);
+    let budget = result2.review_budget.expect("review budget should be set");
+    // file_0.txt from first run + file_1.txt from second run = 2
+    // .conductor/ledger.jsonl is excluded, so not counted
+    assert_eq!(budget.changed_files, 2);
+}
+
+#[test]
+fn blocks_when_ledger_dir_cannot_be_created() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    // Create a regular file at .conductor to block directory creation
+    fs::write(dir.path().join(".conductor"), "blocking file").unwrap();
+    let input = request(dir.path(), create_file_operations(1), json!([]));
+    let result = run_with_reviewer(&input, |_, _| panic!("review must not run"));
+    assert_eq!(result.status, Status::Blocked);
+    assert_eq!(result.phase, "review");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("ledger directory")
+    );
+}

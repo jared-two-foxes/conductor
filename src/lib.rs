@@ -13,6 +13,10 @@ use std::time::Duration;
 const MAX_OUTPUT_CHARS: usize = 16_384;
 const WALL_CLOCK_BUDGET_CAP_SECS: u64 = 600;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRequest {
@@ -55,6 +59,8 @@ pub struct ReviewSettings {
     pub max_repeated_actions: Option<u32>,
     #[serde(default)]
     pub max_completion_attempts: Option<u32>,
+    #[serde(default = "default_true")]
+    pub ledger: bool,
 }
 
 #[derive(Serialize, PartialEq, Eq, Debug)]
@@ -97,6 +103,8 @@ pub struct WorkflowResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_budget: Option<ReviewBudget>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -110,6 +118,7 @@ impl WorkflowResult {
             checks: Vec::new(),
             review: None,
             review_budget: None,
+            ledger_path: None,
             error: None,
         }
     }
@@ -240,14 +249,27 @@ where
     }
 
     output.phase = "review";
+    let ledger_path = if request.review.ledger {
+        match setup_ledger(&request.repository_path) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                output.status = Status::Blocked;
+                output.error = Some(error);
+                return output;
+            }
+        }
+    } else {
+        None
+    };
     let changed_files = count_changed_files(&request.repository_path, &review_request.base_ref);
-    let config = build_review_config(&request.review, changed_files);
+    let config = build_review_config(&request.review, changed_files, ledger_path.clone());
     output.review_budget = Some(ReviewBudget {
         changed_files,
         max_turns: config.max_turns,
         max_tool_calls: config.max_tool_calls,
         wall_clock_budget_secs: config.wall_clock_budget.map(|d| d.as_secs()).unwrap_or(0),
     });
+    output.ledger_path = ledger_path;
     let evaluation = reviewer(&review_request, &config);
     output.review = evaluation.result;
     output.error = evaluation.error;
@@ -261,7 +283,11 @@ where
 
 /// Build the review configuration, scaling omitted limit fields from the
 /// actual post-apply changed-file count.
-fn build_review_config(settings: &ReviewSettings, changed_files: u32) -> ReviewConfig {
+fn build_review_config(
+    settings: &ReviewSettings,
+    changed_files: u32,
+    ledger_path: Option<PathBuf>,
+) -> ReviewConfig {
     let mut config = ReviewConfig::default();
     if let Some(model) = &settings.model {
         config.model = model.clone();
@@ -289,7 +315,68 @@ fn build_review_config(settings: &ReviewSettings, changed_files: u32) -> ReviewC
     if let Some(max_completion_attempts) = settings.max_completion_attempts {
         config.max_completion_attempts = max_completion_attempts;
     }
+
+    config.ledger_path = ledger_path;
+
     config
+}
+
+/// Set up the review ledger directory and exclude it from Git's untracked-file
+/// discovery. Creates `{repo}/.conductor/` and adds `.conductor/` to the
+/// repository's exclude file. Must be called before `count_changed_files` so
+/// the ledger directory is not counted as a changed file. Returns the ledger
+/// file path on success, or an error describing the setup failure.
+fn setup_ledger(repo_path: &std::path::Path) -> Result<PathBuf, String> {
+    let ledger_dir = repo_path.join(".conductor");
+    std::fs::create_dir_all(&ledger_dir)
+        .map_err(|e| format!("Cannot create ledger directory: {e}"))?;
+    add_git_exclude(repo_path, ".conductor/")?;
+    Ok(ledger_dir.join("ledger.jsonl"))
+}
+
+/// Add a pattern to the repository's local exclude file. Uses
+/// `git rev-parse --git-path info/exclude` to resolve the correct path in both
+/// regular repositories and linked worktrees. Only treats a missing file as
+/// empty; other read errors are propagated to avoid clobbering existing
+/// exclusions.
+fn add_git_exclude(repo_path: &std::path::Path, pattern: &str) -> Result<(), String> {
+    let exclude_path = match Command::new("git")
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .current_dir(repo_path)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let p = std::path::Path::new(&raw);
+            if p.is_absolute() {
+                PathBuf::from(p)
+            } else {
+                repo_path.join(p)
+            }
+        }
+        Ok(_) => return Err("Cannot resolve git exclude file path".to_string()),
+        Err(e) => return Err(format!("Cannot run git rev-parse: {e}")),
+    };
+    let existing = match std::fs::read_to_string(&exclude_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Cannot read git exclude file: {e}")),
+    };
+    if !existing.lines().any(|line| line.trim() == pattern) {
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(pattern);
+        content.push('\n');
+        if let Some(parent) = exclude_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create exclude directory: {e}"))?;
+        }
+        std::fs::write(&exclude_path, content)
+            .map_err(|e| format!("Cannot write git exclude file: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Count the number of changed files in the post-apply working-tree diff
