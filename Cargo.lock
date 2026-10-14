@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "agent-kernel"
 version = "0.1.0"
-source = "git+https://github.com/jared-two-foxes/review?rev=2173356a2a2de1fed89484e4e7784f89eedd8baa#2173356a2a2de1fed89484e4e7784f89eedd8baa"
+source = "git+https://github.com/jared-two-foxes/review?rev=565cac8a951069d6ab586e141915a3931fbec8df#565cac8a951069d6ab586e141915a3931fbec8df"
 dependencies = [
  "agent-protocol",
  "hex",
@@ -19,7 +19,7 @@ dependencies = [
 [[package]]
 name = "agent-protocol"
 version = "0.1.0"
-source = "git+https://github.com/jared-two-foxes/review?rev=2173356a2a2de1fed89484e4e7784f89eedd8baa#2173356a2a2de1fed89484e4e7784f89eedd8baa"
+source = "git+https://github.com/jared-two-foxes/review?rev=565cac8a951069d6ab586e141915a3931fbec8df#565cac8a951069d6ab586e141915a3931fbec8df"
 dependencies = [
  "time",
  "uuid",
@@ -260,7 +260,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "code-agent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/jared-two-foxes/review?rev=2173356a2a2de1fed89484e4e7784f89eedd8baa#2173356a2a2de1fed89484e4e7784f89eedd8baa"
+source = "git+https://github.com/jared-two-foxes/review?rev=565cac8a951069d6ab586e141915a3931fbec8df#565cac8a951069d6ab586e141915a3931fbec8df"
 dependencies = [
  "agent-kernel",
  "git2",
@@ -1584,7 +1584,7 @@ dependencies = [
 [[package]]
 name = "review-app"
 version = "0.1.0"
-source = "git+https://github.com/jared-two-foxes/review?rev=2173356a2a2de1fed89484e4e7784f89eedd8baa#2173356a2a2de1fed89484e4e7784f89eedd8baa"
+source = "git+https://github.com/jared-two-foxes/review?rev=565cac8a951069d6ab586e141915a3931fbec8df#565cac8a951069d6ab586e141915a3931fbec8df"
 dependencies = [
  "agent-kernel",
  "agent-protocol",
@@ -1599,7 +1599,7 @@ dependencies = [
 [[package]]
 name = "review-protocol"
 version = "0.1.0"
-source = "git+https://github.com/jared-two-foxes/review?rev=2173356a2a2de1fed89484e4e7784f89eedd8baa#2173356a2a2de1fed89484e4e7784f89eedd8baa"
+source = "git+https://github.com/jared-two-foxes/review?rev=565cac8a951069d6ab586e141915a3931fbec8df#565cac8a951069d6ab586e141915a3931fbec8df"
 dependencies = [
  "serde",
  "serde_json",
