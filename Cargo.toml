@@ -8,8 +8,8 @@ license = "GPL-3.0-only"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 executor = { git = "https://github.com/jared-two-foxes/executor" }
-review-app = { git = "https://github.com/jared-two-foxes/review", rev = "797f268313b70bd5a03334e918a50d01e31b6ca7" }
-review-protocol = { git = "https://github.com/jared-two-foxes/review", rev = "797f268313b70bd5a03334e918a50d01e31b6ca7" }
+review-app = { git = "https://github.com/jared-two-foxes/review", rev = "2173356a2a2de1fed89484e4e7784f89eedd8baa" }
+review-protocol = { git = "https://github.com/jared-two-foxes/review", rev = "2173356a2a2de1fed89484e4e7784f89eedd8baa" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
