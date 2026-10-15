@@ -14,21 +14,22 @@ Example `workflow.json`:
   "repository_path": "/absolute/path/to/project",
   "execution": {
     "operations": [
-      {"type": "create_file", "path": "example.txt", "content": "hello\n"}
+      {"type": "create_file", "path": "example.txt", "content": "hello\n"},
+      {"type": "edit_file", "path": "example.txt", "edits": [{"oldText": "hello", "newText": "Hello"}]}
     ]
   },
   "checks": [
     {"name": "tests", "program": "cargo", "args": ["test", "--locked"]}
   ],
   "review": {
-    "requirements": "Add example.txt containing hello",
+    "requirements": "Add example.txt containing Hello",
     "base_ref": "HEAD",
     "model": "opencode/claude-sonnet-4.5"
   }
 }
 ```
 
-`execution` is the executor library's input schema, unchanged. Operations may interleave patches and file/directory operations. Each check is an **argv array**, not a shell command. Commands execute sequentially from the repository root. The reviewer sees `base_ref` versus `:working`, including uncommitted changes. Design should use a dedicated working tree to avoid mixing unrelated edits into the review.
+`execution` is the executor library's input schema, passed through without translation. Operations may interleave exact-text edits and file/directory operations. Supported types are `create_file`, `edit_file`, `replace_file`, `delete_file`, `move_file`, `create_directory`, `delete_directory`, and `move_directory`. Each check is an **argv array**, not a shell command. Commands execute sequentially from the repository root. The reviewer sees `base_ref` versus `:working`, including uncommitted changes. Design should use a dedicated working tree to avoid mixing unrelated edits into the review.
 
 Output is one JSON object (`conductor.result/v1`) with `status`, `phase`, executor outcome, completed check results, review result, and optional error:
 
@@ -37,6 +38,28 @@ Output is one JSON object (`conductor.result/v1`) with `status`, `phase`, execut
 - `BLOCKED` (exit 3): invalid input, missing verification tool, or indeterminate/unavailable review. No AI retry is attempted.
 
 Failures always return to Design. Conductor never rewrites or regenerates operations.
+
+### Exact-text edits and patch migration
+
+`edit_file` applies literal `oldText`/`newText` replacements to an existing regular UTF-8 file. Every `oldText` must be non-empty and match exactly once, and edit ranges must not overlap. All edits in one operation resolve against the same original contents at the start of that operation, after earlier operations have completed. No whitespace or line-ending normalization occurs. Match validation completes before that operation writes the file; earlier successful operations are not rolled back on failure.
+
+**Breaking input change:** the former `patch` operation, including both inline and file-source forms, is no longer accepted. Conductor does not import or translate unified diffs. Replace localized patches with `edit_file`, use `replace_file` for hash-guarded whole-file replacement, and use explicit file/directory operations for structural changes. A legacy patch anywhere in a request fails deserialization before execution: the CLI returns `BLOCKED` with `phase: "input"`, and no operations run. The `conductor.request/v1` and `conductor.result/v1` envelope names are unchanged.
+
+### Affected-file reporting
+
+The nested `execution` outcome now always includes `affected_files`, for example:
+
+```json
+{
+  "success": true,
+  "operations_applied": 2,
+  "affected_files": ["example.txt"]
+}
+```
+
+Only a fully successful execution batch populates this list. Paths are sorted, unique, repository-relative, use `/` separators, and identify surviving affected regular files at their final locations. Files targeted by identical-content edits and files relocated by directory moves are included; deleted files, directories, symlinks, and unrelated pre-existing working-tree changes are not. Empty batches and every execution failure, including partial application, report `[]`; earlier changes remain applied. The list is not a Git baseline diff or a partial-execution recovery ledger. Later check or review failures do not erase the outcome of a successful execution.
+
+Conductor exposes Executor's metadata unchanged; it does not format files in this version. Consumers that reject unknown output fields must allow `execution.affected_files`. Rebuild and replace installed Conductor binaries before sending `edit_file` requests; changing this repository's dependency alone does not upgrade an installed binary.
 
 ## Development
 

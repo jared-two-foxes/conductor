@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-executor = { git = "https://github.com/jared-two-foxes/executor" }
+executor = { git = "https://github.com/jared-two-foxes/executor", rev = "23e02c35ac3e2ad2fe97f792e111dd284f65f02c" }
 review-app = { git = "https://github.com/jared-two-foxes/review", rev = "1aae3873b6021b492c280d1a778799534780904c" }
 review-protocol = { git = "https://github.com/jared-two-foxes/review", rev = "1aae3873b6021b492c280d1a778799534780904c" }
 serde = { version = "1", features = ["derive"] }

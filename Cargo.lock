@@ -450,7 +450,7 @@ dependencies = [
 [[package]]
 name = "executor"
 version = "0.1.0"
-source = "git+https://github.com/jared-two-foxes/executor#025328f3f5da11f501dc9325bc914fcd14c88039"
+source = "git+https://github.com/jared-two-foxes/executor?rev=23e02c35ac3e2ad2fe97f792e111dd284f65f02c#23e02c35ac3e2ad2fe97f792e111dd284f65f02c"
 dependencies = [
  "clap",
  "git2",

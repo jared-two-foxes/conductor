@@ -2,7 +2,9 @@ use conductor::{ReviewDecision, ReviewEvaluation, Status, WorkflowRequest, run_w
 use git2::Repository;
 use serde_json::json;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -26,6 +28,89 @@ fn approved() -> ReviewEvaluation {
         decision: ReviewDecision::Approved,
         result: Some(json!({"status": "APPROVED"})),
         error: None,
+    }
+}
+
+#[test]
+fn exact_text_edits_use_original_contents_before_checks_and_review() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    fs::write(dir.path().join("target.txt"), "alpha beta\n").unwrap();
+    fs::write(dir.path().join("expected.txt"), "beta gamma\n").unwrap();
+    let input = request(
+        dir.path(),
+        json!([{
+            "type": "edit_file",
+            "path": "target.txt",
+            "edits": [
+                {"oldText": "alpha", "newText": "beta"},
+                {"oldText": "beta", "newText": "gamma"}
+            ]
+        }]),
+        json!([{
+            "name": "edited contents",
+            "program": "git",
+            "args": ["diff", "--no-index", "--", "expected.txt", "target.txt"]
+        }]),
+    );
+    let result = run_with_reviewer(&input, |_, _| {
+        assert_eq!(
+            fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+            "beta gamma\n"
+        );
+        approved()
+    });
+    assert_eq!(result.status, Status::Passed);
+    assert_eq!(result.phase, "review");
+    assert_eq!(result.checks.len(), 1);
+    assert_eq!(result.checks[0].exit_code, Some(0));
+    let execution = result.execution.unwrap();
+    assert_eq!(execution.operations_applied, 1);
+    assert_eq!(execution.affected_files, vec!["target.txt"]);
+}
+
+#[test]
+fn exact_text_match_failures_skip_checks_and_review() {
+    for (contents, old_text, reason) in [
+        ("alpha beta\n", "missing", "missing"),
+        ("alpha alpha\n", "alpha", "ambiguous"),
+    ] {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        fs::write(dir.path().join("target.txt"), contents).unwrap();
+        let input = request(
+            dir.path(),
+            json!([
+                {"type": "create_file", "path": "created.txt", "content": "retained\n"},
+                {
+                    "type": "edit_file",
+                    "path": "target.txt",
+                    "edits": [{"oldText": old_text, "newText": "replacement"}]
+                }
+            ]),
+            json!([{"name": "must not run", "program": "git", "args": ["status"]}]),
+        );
+        let result = run_with_reviewer(&input, |_, _| panic!("review must not run"));
+        assert_eq!(result.status, Status::NeedsDesign);
+        assert_eq!(result.phase, "execution");
+        assert!(result.checks.is_empty());
+        assert!(result.review.is_none());
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains("edit_file target.txt"), "{error}");
+        assert!(error.contains(reason), "{error}");
+        let execution = result.execution.unwrap();
+        assert!(!execution.success);
+        assert_eq!(execution.operations_applied, 1);
+        assert_eq!(execution.failed_operation, Some(1));
+        assert!(execution.affected_files.is_empty());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+            contents
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("created.txt")).unwrap(),
+            "retained\n"
+        );
     }
 }
 
@@ -72,7 +157,9 @@ fn executor_failure_returns_to_design_without_checks_or_review() {
     let result = run_with_reviewer(&input, |_, _| panic!("review must not run"));
     assert_eq!(result.status, Status::NeedsDesign);
     assert_eq!(result.phase, "execution");
-    assert_eq!(result.execution.unwrap().operations_applied, 1);
+    let execution = result.execution.unwrap();
+    assert_eq!(execution.operations_applied, 1);
+    assert!(execution.affected_files.is_empty());
     assert!(result.checks.is_empty());
     assert_eq!(
         fs::read_to_string(dir.path().join("created.txt")).unwrap(),
@@ -219,6 +306,127 @@ fn rejects_zero_max_completion_attempts() {
     let result = run_with_reviewer(&input, |_, _| panic!("review must not run"));
     assert_eq!(result.status, Status::Blocked);
     assert_eq!(result.phase, "input");
+}
+
+#[test]
+fn legacy_patch_inputs_are_blocked_before_any_operations_run() {
+    let patch = concat!(
+        "diff --git a/existing.txt b/existing.txt\n",
+        "--- a/existing.txt\n",
+        "+++ b/existing.txt\n",
+        "@@ -1 +1 @@\n",
+        "-before\n",
+        "+after\n"
+    );
+    for source in [
+        json!({"type": "inline", "patch": patch}),
+        json!({"type": "file", "path": "change.patch"}),
+    ] {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        fs::write(dir.path().join("existing.txt"), "before\n").unwrap();
+        fs::write(dir.path().join("change.patch"), patch).unwrap();
+        let input = json!({
+            "schema": "conductor.request/v1",
+            "repository_path": dir.path(),
+            "execution": { "operations": [
+                {"type": "create_file", "path": "created.txt", "content": "must not exist"},
+                {"type": "patch", "source": source}
+            ] },
+            "checks": [{"name": "must not run", "program": "git", "args": ["status"]}],
+            "review": {"requirements": "Must reject legacy patches before execution"}
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_conductor"))
+            .args(["run", "--request", "-"])
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&input).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["schema"], "conductor.result/v1");
+        assert_eq!(result["status"], "BLOCKED");
+        assert_eq!(result["phase"], "input");
+        assert!(result["error"].as_str().unwrap().contains("patch"));
+        assert_eq!(result["checks"], json!([]));
+        assert!(result.get("execution").is_none());
+        assert!(result.get("review").is_none());
+        assert!(!dir.path().join("created.txt").exists());
+        assert!(!dir.path().join(".conductor").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
+            "before\n"
+        );
+    }
+}
+
+#[test]
+fn serializes_affected_files_at_final_locations_without_unrelated_changes() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    fs::write(dir.path().join("initial.txt"), "unrelated tracked change\n").unwrap();
+    fs::write(dir.path().join("unrelated.txt"), "unrelated untracked file\n").unwrap();
+    fs::create_dir(dir.path().join("old")).unwrap();
+    fs::write(dir.path().join("old/z.txt"), "same\n").unwrap();
+    fs::write(dir.path().join("old/a.txt"), "moved without editing\n").unwrap();
+    let input = request(
+        dir.path(),
+        json!([
+            {"type": "edit_file", "path": "old/z.txt", "edits": [
+                {"oldText": "same", "newText": "same"}
+            ]},
+            {"type": "move_directory", "from": "old", "to": "new"},
+            {"type": "create_file", "path": "deleted.txt", "content": "temporary"},
+            {"type": "delete_file", "path": "deleted.txt"},
+            {"type": "create_file", "path": "added.txt", "content": "added"}
+        ]),
+        json!([]),
+    );
+    let result = run_with_reviewer(&input, |_, _| approved());
+    assert_eq!(result.status, Status::Passed);
+    let serialized = serde_json::to_value(&result).unwrap();
+    assert_eq!(serialized["schema"], "conductor.result/v1");
+    assert_eq!(serialized["execution"]["operations_applied"], 5);
+    assert_eq!(
+        serialized["execution"]["affected_files"],
+        json!(["added.txt", "new/a.txt", "new/z.txt"])
+    );
+    assert!(!dir.path().join("old").exists());
+    assert!(!dir.path().join("deleted.txt").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("initial.txt")).unwrap(),
+        "unrelated tracked change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("unrelated.txt")).unwrap(),
+        "unrelated untracked file\n"
+    );
+}
+
+#[test]
+fn serializes_empty_affected_files_for_successful_empty_batches() {
+    let dir = tempdir().unwrap();
+    init_repo_with_commit(dir.path());
+    let input = request(dir.path(), json!([]), json!([]));
+    let result = run_with_reviewer(&input, |_, _| approved());
+    assert_eq!(result.status, Status::Passed);
+    let serialized = serde_json::to_value(&result).unwrap();
+    assert_eq!(serialized["execution"]["operations_applied"], 0);
+    assert_eq!(serialized["execution"]["affected_files"], json!([]));
 }
 
 fn init_repo_with_commit(dir: &Path) {
