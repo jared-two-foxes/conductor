@@ -379,7 +379,11 @@ fn serializes_affected_files_at_final_locations_without_unrelated_changes() {
     let dir = tempdir().unwrap();
     init_repo_with_commit(dir.path());
     fs::write(dir.path().join("initial.txt"), "unrelated tracked change\n").unwrap();
-    fs::write(dir.path().join("unrelated.txt"), "unrelated untracked file\n").unwrap();
+    fs::write(
+        dir.path().join("unrelated.txt"),
+        "unrelated untracked file\n",
+    )
+    .unwrap();
     fs::create_dir(dir.path().join("old")).unwrap();
     fs::write(dir.path().join("old/z.txt"), "same\n").unwrap();
     fs::write(dir.path().join("old/a.txt"), "moved without editing\n").unwrap();
