@@ -1,6 +1,10 @@
 //! Deterministic coordinator: Design supplies the complete execution input.
-//! Conductor applies it, runs checks, then requests a review. No retries or
+//! Conductor applies it, formats affected files, runs checks, then requests a review. No retries or
 //! rewriting of executor input occur in this layer.
+
+mod formatting;
+
+pub use formatting::{Formatter, FormatterResult};
 
 use review_app::ReviewConfig;
 use review_protocol::{ReviewRequest, ReviewStatus};
@@ -23,6 +27,8 @@ pub struct WorkflowRequest {
     pub schema: String,
     pub repository_path: PathBuf,
     pub execution: executor::Input,
+    #[serde(default)]
+    pub formatters: Vec<Formatter>,
     #[serde(default)]
     pub checks: Vec<Check>,
     pub review: ReviewSettings,
@@ -97,6 +103,7 @@ pub struct WorkflowResult {
     pub phase: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<executor::Outcome>,
+    pub formatters: Vec<FormatterResult>,
     pub checks: Vec<CheckResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<Value>,
@@ -115,6 +122,7 @@ impl WorkflowResult {
             status,
             phase,
             execution: None,
+            formatters: Vec::new(),
             checks: Vec::new(),
             review: None,
             review_budget: None,
@@ -161,7 +169,7 @@ pub fn run(request: &WorkflowRequest) -> WorkflowResult {
 }
 
 /// Injection point for deterministic tests. Only the reviewer is substituted;
-/// executor and check commands use their real implementations.
+/// executor, formatter and check commands use their real implementations.
 pub fn run_with_reviewer<F>(request: &WorkflowRequest, reviewer: F) -> WorkflowResult
 where
     F: FnOnce(&ReviewRequest, &ReviewConfig) -> ReviewEvaluation,
@@ -178,6 +186,9 @@ where
         .any(|check| check.name.trim().is_empty() || check.program.trim().is_empty())
     {
         return WorkflowResult::blocked("input", "Check name and program must not be empty");
+    }
+    if let Err(error) = formatting::validate(&request.formatters) {
+        return WorkflowResult::blocked("input", error);
     }
     if request.review.max_turns == Some(0)
         || request.review.max_tool_calls == Some(0)
@@ -215,6 +226,18 @@ where
     if !success {
         output.status = Status::NeedsDesign;
         output.error = error;
+        return output;
+    }
+
+    output.phase = "formatting";
+    if let Err(failure) = formatting::run(
+        &request.repository_path,
+        &request.formatters,
+        &output.execution.as_ref().unwrap().affected_files,
+        &mut output.formatters,
+    ) {
+        output.status = failure.status;
+        output.error = Some(failure.error);
         return output;
     }
 
