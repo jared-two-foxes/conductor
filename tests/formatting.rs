@@ -308,7 +308,9 @@ fn formatter_failure_retains_prior_writes_and_skips_later_phases() {
     let input = request(
         dir.path(),
         json!([
-            create("c.rs", "c"), create("b.rs", "b"), create("a.rs", "a")
+            create("c.rs", "c"),
+            create("b.rs", "b"),
+            create("a.rs", "a")
         ]),
         json!([rule("select-fail")]),
         json!([{"name": "must not run", "program": "git", "args": ["status"]}]),
@@ -323,7 +325,11 @@ fn formatter_failure_retains_prior_writes_and_skips_later_phases() {
     assert!(result.formatters[0].changed);
     assert_eq!(result.formatters[1].exit_code, Some(42));
     assert!(!result.formatters[1].changed);
-    assert!(result.formatters[1].stderr.contains("fixture formatter failed"));
+    assert!(
+        result.formatters[1]
+            .stderr
+            .contains("fixture formatter failed")
+    );
     for (path, expected) in [("a.rs", "A"), ("b.rs", "b"), ("c.rs", "c")] {
         assert_eq!(fs::read_to_string(dir.path().join(path)).unwrap(), expected);
     }
@@ -411,7 +417,10 @@ fn invalid_output_takes_precedence_when_formatter_does_not_consume_large_stdin()
         assert!(!result.formatters[0].changed);
         assert!(result.checks.is_empty());
         assert!(result.error.unwrap().contains(reason));
-        assert_eq!(fs::read_to_string(dir.path().join("file.rs")).unwrap(), source);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.rs")).unwrap(),
+            source
+        );
     }
 }
 
@@ -424,9 +433,7 @@ fn unchanged_output_preserves_modification_time() {
         .write(true)
         .open(&source)
         .unwrap()
-        .set_times(
-            FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000)),
-        )
+        .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000)))
         .unwrap();
     let modified = fs::metadata(&source).unwrap().modified().unwrap();
     let input = request(
@@ -467,7 +474,9 @@ fn replacement_preserves_permissions_and_cleans_temporary_siblings() {
     let result = run_with_reviewer(&input, |_, _| approved());
     assert_eq!(result.status, Status::Passed);
     assert!(result.formatters[0].changed);
-    let permissions = fs::metadata(dir.path().join("new.rs")).unwrap().permissions();
+    let permissions = fs::metadata(dir.path().join("new.rs"))
+        .unwrap()
+        .permissions();
     assert_eq!(permissions.readonly(), original_permissions.readonly());
     #[cfg(unix)]
     {
@@ -537,7 +546,10 @@ fn target_renamed_during_formatting_is_reported_without_following_or_recreating_
     assert!(result.review.is_none());
     let error = result.error.unwrap();
     assert!(error.contains("file.rs"), "{error}");
-    assert!(error.contains("Cannot inspect formatting target"), "{error}");
+    assert!(
+        error.contains("Cannot inspect formatting target"),
+        "{error}"
+    );
     assert!(!dir.path().join("file.rs").exists());
     assert_eq!(
         fs::read_to_string(dir.path().join("renamed.rs")).unwrap(),
@@ -593,7 +605,10 @@ fn rustfmt_stdin_uses_local_configuration_without_formatting_child_modules() {
     let formatter = std::env::var("RUSTFMT").unwrap_or_else(|_| "rustfmt".into());
     let input = request(
         dir.path(),
-        json!([create("src/lib.rs", "mod child;\npub fn sum(a:i32,b:i32)->i32{a+b}\n")]),
+        json!([create(
+            "src/lib.rs",
+            "mod child;\npub fn sum(a:i32,b:i32)->i32{a+b}\n"
+        )]),
         json!([{
             "name": "rust", "extensions": ["rs"], "program": formatter,
             "args": ["--edition", "2024", "--emit", "stdout", "--config-path", "{parent}"]

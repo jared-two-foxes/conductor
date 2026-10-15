@@ -133,7 +133,10 @@ pub(crate) fn run(
             results.push(result);
             outcome.map_err(|failure| Failure {
                 status: failure.status,
-                error: format!("Formatter '{}' for '{}': {}", rule.name, path, failure.error),
+                error: format!(
+                    "Formatter '{}' for '{}': {}",
+                    rule.name, path, failure.error
+                ),
             })?;
         }
     }
@@ -156,16 +159,18 @@ fn format_file(root: &Path, rule: &Formatter, result: &mut FormatterResult) -> R
     if !output.status.success() {
         return Err(Failure::needs_design("Formatter exited unsuccessfully"));
     }
-    std::str::from_utf8(&output.stdout)
-        .map_err(|error| Failure::needs_design(format!("Formatter stdout is not UTF-8: {error}")))?;
+    std::str::from_utf8(&output.stdout).map_err(|error| {
+        Failure::needs_design(format!("Formatter stdout is not UTF-8: {error}"))
+    })?;
     if output.stdout.is_empty() && !original.is_empty() {
         return Err(Failure::needs_design(
             "Formatter stdout is empty for nonempty input",
         ));
     }
     written.map_err(|error| Failure::blocked(format!("Cannot supply formatter stdin: {error}")))?;
-    result.changed = replace_if_unchanged(root, &result.path, &original, &output.stdout, permissions)
-        .map_err(Failure::blocked)?;
+    result.changed =
+        replace_if_unchanged(root, &result.path, &original, &output.stdout, permissions)
+            .map_err(Failure::blocked)?;
     Ok(())
 }
 
@@ -191,19 +196,25 @@ fn transform(
         .spawn()?;
     let mut stdin = child.stdin.take().expect("piped formatter stdin");
     thread::scope(|scope| {
-        let writer = match thread::Builder::new().spawn_scoped(scope, move || stdin.write_all(source)) {
+        let writer = match thread::Builder::new()
+            .spawn_scoped(scope, move || stdin.write_all(source))
+        {
             Ok(writer) => writer,
             Err(error) => {
                 if let Err(cleanup) = child.kill() {
                     return Err(io::Error::new(
                         error.kind(),
-                        format!("Stdin writer creation failed: {error}; child termination failed: {cleanup}"),
+                        format!(
+                            "Stdin writer creation failed: {error}; child termination failed: {cleanup}"
+                        ),
                     ));
                 }
                 if let Err(cleanup) = child.wait() {
                     return Err(io::Error::new(
                         error.kind(),
-                        format!("Stdin writer creation failed: {error}; child reaping failed: {cleanup}"),
+                        format!(
+                            "Stdin writer creation failed: {error}; child reaping failed: {cleanup}"
+                        ),
                     ));
                 }
                 return Err(error);
@@ -339,14 +350,9 @@ mod tests {
         fs::write(&target, "original").unwrap();
         let permissions = fs::metadata(&target).unwrap().permissions();
         fs::write(&target, "external change").unwrap();
-        let error = replace_if_unchanged(
-            dir.path(),
-            "file.rs",
-            b"original",
-            b"original",
-            permissions,
-        )
-        .unwrap_err();
+        let error =
+            replace_if_unchanged(dir.path(), "file.rs", b"original", b"original", permissions)
+                .unwrap_err();
         assert!(error.contains("changed"));
         assert_eq!(fs::read_to_string(target).unwrap(), "external change");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -385,11 +391,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("file.rs"), "outside").unwrap();
         symlink(outside.path(), dir.path().join("linked-directory")).unwrap();
-        symlink(
-            outside.path().join("file.rs"),
-            dir.path().join("linked.rs"),
-        )
-        .unwrap();
+        symlink(outside.path().join("file.rs"), dir.path().join("linked.rs")).unwrap();
         assert!(checked_target(dir.path(), "linked.rs").is_err());
         assert!(checked_target(dir.path(), "linked-directory/file.rs").is_err());
     }
