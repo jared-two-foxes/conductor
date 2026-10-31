@@ -1,99 +1,63 @@
-//! Deterministic coordinator: Design supplies the complete execution input.
-//! Conductor applies it, formats affected files, runs checks, then requests a review. No retries or
-//! rewriting of executor input occur in this layer.
+//! Run caller-supplied commands in order, stopping at the first failure.
+//! Conductor assigns no meaning to command names or output and has no knowledge
+//! of source changes, verification, review, Git, or task lifecycle policy.
 
-mod formatting;
-
-pub use formatting::{Formatter, FormatterResult};
-
-use review_app::ReviewConfig;
-use review_protocol::{ReviewRequest, ReviewStatus};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 const MAX_OUTPUT_CHARS: usize = 16_384;
-const WALL_CLOCK_BUDGET_CAP_SECS: u64 = 600;
-
-fn default_true() -> bool {
-    true
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRequest {
     pub schema: String,
-    pub repository_path: PathBuf,
-    pub execution: executor::Input,
-    #[serde(default)]
-    pub formatters: Vec<Formatter>,
-    #[serde(default)]
-    pub checks: Vec<Check>,
-    pub review: ReviewSettings,
+    pub working_directory: PathBuf,
+    pub commands: Vec<CommandSpec>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Check {
+pub struct CommandSpec {
     pub name: String,
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewSettings {
-    pub requirements: String,
-    #[serde(default)]
-    pub base_ref: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub provider_root: Option<String>,
-    #[serde(default)]
-    pub max_turns: Option<u32>,
-    #[serde(default)]
-    pub max_tool_calls: Option<u32>,
-    #[serde(default)]
-    pub wall_clock_budget_secs: Option<u64>,
-    #[serde(default)]
-    pub max_cost_usd: Option<f64>,
-    #[serde(default)]
-    pub max_repeated_actions: Option<u32>,
-    #[serde(default)]
-    pub max_completion_attempts: Option<u32>,
-    #[serde(default = "default_true")]
-    pub ledger: bool,
-}
-
 #[derive(Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
     Passed,
-    NeedsDesign,
+    Failed,
     Blocked,
 }
 
+impl Status {
+    /// Runner exit codes, independent of any child command's exit code.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Passed => 0,
+            Self::Failed => 1,
+            Self::Blocked => 2,
+        }
+    }
+}
+
 #[derive(Serialize)]
-pub struct CheckResult {
+pub struct CommandResult {
+    pub index: usize,
     pub name: String,
     pub program: String,
+    pub args: Vec<String>,
+    pub status: Status,
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
-}
-
-/// Reports the review budget applied by Conductor, including the
-/// changed-file count used to derive scaled defaults.
-#[derive(Serialize)]
-pub struct ReviewBudget {
-    pub changed_files: u32,
-    pub max_turns: u32,
-    pub max_tool_calls: u32,
-    pub wall_clock_budget_secs: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -101,347 +65,142 @@ pub struct WorkflowResult {
     pub schema: &'static str,
     pub status: Status,
     pub phase: &'static str,
+    pub commands: Vec<CommandResult>,
+    /// Zero-based index of the command that failed or could not be started.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution: Option<executor::Outcome>,
-    pub formatters: Vec<FormatterResult>,
-    pub checks: Vec<CheckResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub review: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub review_budget: Option<ReviewBudget>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ledger_path: Option<PathBuf>,
+    pub failed_command_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl WorkflowResult {
-    fn new(status: Status, phase: &'static str) -> Self {
-        Self {
-            schema: "conductor.result/v1",
-            status,
-            phase,
-            execution: None,
-            formatters: Vec::new(),
-            checks: Vec::new(),
-            review: None,
-            review_budget: None,
-            ledger_path: None,
-            error: None,
-        }
-    }
-
     pub fn blocked(phase: &'static str, error: impl Into<String>) -> Self {
-        let mut result = Self::new(Status::Blocked, phase);
-        result.error = Some(error.into());
-        result
-    }
-}
-
-pub enum ReviewDecision {
-    Approved,
-    ChangesRequested,
-    Indeterminate,
-}
-
-pub struct ReviewEvaluation {
-    pub decision: ReviewDecision,
-    pub result: Option<Value>,
-    pub error: Option<String>,
-}
-
-/// Production entry point. Review is invoked through the review-app library,
-/// not a review-cli subprocess.
-pub fn run(request: &WorkflowRequest) -> WorkflowResult {
-    run_with_reviewer(request, |review_request, config| {
-        let (result, _events, error) = review_app::run_review(review_request, config, None);
-        let decision = match result.status {
-            ReviewStatus::Approved => ReviewDecision::Approved,
-            ReviewStatus::ChangesRequested => ReviewDecision::ChangesRequested,
-            ReviewStatus::Indeterminate => ReviewDecision::Indeterminate,
-        };
-        ReviewEvaluation {
-            decision,
-            result: serde_json::to_value(&result).ok(),
-            error,
+        Self {
+            schema: "conductor.result/v2",
+            status: Status::Blocked,
+            phase,
+            commands: Vec::new(),
+            failed_command_index: None,
+            error: Some(error.into()),
         }
-    })
+    }
 }
 
-/// Injection point for deterministic tests. Only the reviewer is substituted;
-/// executor, formatter and check commands use their real implementations.
-pub fn run_with_reviewer<F>(request: &WorkflowRequest, reviewer: F) -> WorkflowResult
-where
-    F: FnOnce(&ReviewRequest, &ReviewConfig) -> ReviewEvaluation,
-{
-    if request.schema != "conductor.request/v1" {
-        return WorkflowResult::blocked("input", "Unsupported request schema");
-    }
-    if request.review.requirements.trim().is_empty() {
-        return WorkflowResult::blocked("input", "Review requirements must not be empty");
-    }
-    if request
-        .checks
-        .iter()
-        .any(|check| check.name.trim().is_empty() || check.program.trim().is_empty())
-    {
-        return WorkflowResult::blocked("input", "Check name and program must not be empty");
-    }
-    if let Err(error) = formatting::validate(&request.formatters) {
-        return WorkflowResult::blocked("input", error);
-    }
-    if request.review.max_turns == Some(0)
-        || request.review.max_tool_calls == Some(0)
-        || request.review.wall_clock_budget_secs == Some(0)
-        || request.review.max_repeated_actions == Some(0)
-        || request.review.max_completion_attempts == Some(0)
-        || request
-            .review
-            .max_cost_usd
-            .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
-    {
-        return WorkflowResult::blocked("input", "Invalid review limits");
-    }
-
-    let review_request = ReviewRequest {
-        schema: "review.request/v1".to_owned(),
-        repository_path: request.repository_path.to_string_lossy().into_owned(),
-        base_ref: request
-            .review
-            .base_ref
-            .clone()
-            .unwrap_or_else(|| "HEAD".into()),
-        head_ref: ":working".into(),
-        requirements: Some(request.review.requirements.clone()),
+/// Validate the whole request before starting any command. An empty list is a
+/// successful no-op. Commands receive closed stdin and run without a shell.
+pub fn run(request: &WorkflowRequest) -> WorkflowResult {
+    let directory = match validate(request) {
+        Ok(directory) => directory,
+        Err(error) => return WorkflowResult::blocked("input", error),
     };
-    if let Err(error) = review_protocol::validate_request(&review_request) {
-        return WorkflowResult::blocked("input", error);
-    }
-
-    let mut output = WorkflowResult::new(Status::Blocked, "execution");
-    let applied = executor::apply(&request.repository_path, &request.execution);
-    let success = applied.success;
-    let error = applied.error.clone();
-    output.execution = Some(applied);
-    if !success {
-        output.status = Status::NeedsDesign;
-        output.error = error;
-        return output;
-    }
-
-    output.phase = "formatting";
-    if let Err(failure) = formatting::run(
-        &request.repository_path,
-        &request.formatters,
-        &output.execution.as_ref().unwrap().affected_files,
-        &mut output.formatters,
-    ) {
-        output.status = failure.status;
-        output.error = Some(failure.error);
-        return output;
-    }
-
-    for check in &request.checks {
-        output.phase = "verification";
-        let result = Command::new(&check.program)
-            .args(&check.args)
-            .current_dir(&request.repository_path)
+    let mut output = WorkflowResult {
+        schema: "conductor.result/v2",
+        status: Status::Passed,
+        phase: "completed",
+        commands: Vec::new(),
+        failed_command_index: None,
+        error: None,
+    };
+    for (index, command) in request.commands.iter().enumerate() {
+        // Bare names use PATH. Explicit relative executable paths are resolved
+        // before setting current_dir, avoiding platform-dependent resolution.
+        let program = resolve_program(&directory, &command.program);
+        let result = Command::new(program)
+            .args(&command.args)
+            .current_dir(&directory)
             .output();
+        let mut record = CommandResult {
+            index,
+            name: command.name.clone(),
+            program: command.program.clone(),
+            args: command.args.clone(),
+            status: Status::Blocked,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            error: None,
+        };
         match result {
             Ok(result) => {
-                let succeeded = result.status.success();
-                let exit_code = result.status.code();
-                output.checks.push(CheckResult {
-                    name: check.name.clone(),
-                    program: check.program.clone(),
-                    exit_code,
-                    stdout: bounded(&result.stdout),
-                    stderr: bounded(&result.stderr),
-                });
-                if !succeeded {
-                    output.status = Status::NeedsDesign;
-                    output.error = Some(format!("Check '{}' failed", check.name));
-                    return output;
-                }
+                record.exit_code = result.status.code();
+                (record.stdout, record.stdout_truncated) = bounded(&result.stdout);
+                (record.stderr, record.stderr_truncated) = bounded(&result.stderr);
+                record.status = if result.status.success() {
+                    Status::Passed
+                } else {
+                    record.error = Some(format!(
+                        "Command '{}' failed ({})",
+                        command.name, result.status
+                    ));
+                    Status::Failed
+                };
             }
             Err(error) => {
-                output.error = Some(format!("Cannot start check '{}': {error}", check.name));
-                return output;
+                record.error = Some(format!("Cannot run command '{}': {error}", command.name));
             }
+        }
+        let succeeded = record.status == Status::Passed;
+        if !succeeded {
+            output.status = if record.status == Status::Failed {
+                Status::Failed
+            } else {
+                Status::Blocked
+            };
+            output.phase = "commands";
+            output.failed_command_index = Some(index);
+            output.error = record.error.clone();
+        }
+        output.commands.push(record);
+        if !succeeded {
+            break;
         }
     }
-
-    output.phase = "review";
-    let ledger_path = if request.review.ledger {
-        match setup_ledger(&request.repository_path) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                output.status = Status::Blocked;
-                output.error = Some(error);
-                return output;
-            }
-        }
-    } else {
-        None
-    };
-    let changed_files = count_changed_files(&request.repository_path, &review_request.base_ref);
-    let config = build_review_config(&request.review, changed_files, ledger_path.clone());
-    output.review_budget = Some(ReviewBudget {
-        changed_files,
-        max_turns: config.max_turns,
-        max_tool_calls: config.max_tool_calls,
-        wall_clock_budget_secs: config.wall_clock_budget.map(|d| d.as_secs()).unwrap_or(0),
-    });
-    output.ledger_path = ledger_path;
-    let evaluation = reviewer(&review_request, &config);
-    output.review = evaluation.result;
-    output.error = evaluation.error;
-    output.status = match evaluation.decision {
-        ReviewDecision::Approved if output.error.is_none() => Status::Passed,
-        ReviewDecision::ChangesRequested => Status::NeedsDesign,
-        ReviewDecision::Approved | ReviewDecision::Indeterminate => Status::Blocked,
-    };
     output
 }
 
-/// Build the review configuration, scaling omitted limit fields from the
-/// actual post-apply changed-file count.
-fn build_review_config(
-    settings: &ReviewSettings,
-    changed_files: u32,
-    ledger_path: Option<PathBuf>,
-) -> ReviewConfig {
-    let mut config = ReviewConfig::default();
-    if let Some(model) = &settings.model {
-        config.model = model.clone();
+fn validate(request: &WorkflowRequest) -> Result<PathBuf, String> {
+    if request.schema != "conductor.request/v2" {
+        return Err("Unsupported request schema; expected conductor.request/v2".into());
     }
-    config.provider_root = settings.provider_root.clone();
-
-    config.max_turns = settings.max_turns.unwrap_or_else(|| {
-        let scaled = 8u32.saturating_add(changed_files.saturating_mul(2));
-        scaled.max(10)
-    });
-    config.max_tool_calls = settings.max_tool_calls.unwrap_or_else(|| {
-        let scaled = 12u32.saturating_add(changed_files.saturating_mul(3));
-        scaled.max(20)
-    });
-    let wall_secs = settings.wall_clock_budget_secs.unwrap_or_else(|| {
-        let scaled = 30u32.saturating_add(changed_files.saturating_mul(8));
-        (scaled.max(60) as u64).min(WALL_CLOCK_BUDGET_CAP_SECS)
-    });
-    config.wall_clock_budget = Some(Duration::from_secs(wall_secs));
-
-    config.max_cost_usd = settings.max_cost_usd;
-    if let Some(max_repeated_actions) = settings.max_repeated_actions {
-        config.max_repeated_actions = max_repeated_actions;
+    if !request.working_directory.is_absolute() {
+        return Err("working_directory must be an absolute directory path".into());
     }
-    if let Some(max_completion_attempts) = settings.max_completion_attempts {
-        config.max_completion_attempts = max_completion_attempts;
+    let directory = request
+        .working_directory
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve working_directory: {error}"))?;
+    if !directory.is_dir() {
+        return Err("working_directory must be a directory".into());
     }
-
-    config.ledger_path = ledger_path;
-
-    config
+    for (index, command) in request.commands.iter().enumerate() {
+        if command.name.trim().is_empty() || command.program.trim().is_empty() {
+            return Err(format!(
+                "Command {index}: name and program must not be empty"
+            ));
+        }
+        if command.program.contains('\0') || command.args.iter().any(|arg| arg.contains('\0')) {
+            return Err(format!(
+                "Command {index}: program and args must not contain NUL"
+            ));
+        }
+    }
+    Ok(directory)
 }
 
-/// Set up the review ledger directory and exclude it from Git's untracked-file
-/// discovery. Creates `{repo}/.conductor/` and adds `.conductor/` to the
-/// repository's exclude file. Must be called before `count_changed_files` so
-/// the ledger directory is not counted as a changed file. Returns the ledger
-/// file path on success, or an error describing the setup failure.
-fn setup_ledger(repo_path: &std::path::Path) -> Result<PathBuf, String> {
-    let ledger_dir = repo_path.join(".conductor");
-    std::fs::create_dir_all(&ledger_dir)
-        .map_err(|e| format!("Cannot create ledger directory: {e}"))?;
-    add_git_exclude(repo_path, ".conductor/")?;
-    Ok(ledger_dir.join("ledger.jsonl"))
+fn resolve_program(directory: &Path, program: &str) -> PathBuf {
+    let path = Path::new(program);
+    if !path.is_absolute() && path.components().count() > 1 {
+        directory.join(path)
+    } else {
+        path.into()
+    }
 }
 
-/// Add a pattern to the repository's local exclude file. Uses
-/// `git rev-parse --git-path info/exclude` to resolve the correct path in both
-/// regular repositories and linked worktrees. Only treats a missing file as
-/// empty; other read errors are propagated to avoid clobbering existing
-/// exclusions.
-fn add_git_exclude(repo_path: &std::path::Path, pattern: &str) -> Result<(), String> {
-    let exclude_path = match Command::new("git")
-        .args(["rev-parse", "--git-path", "info/exclude"])
-        .current_dir(repo_path)
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let p = std::path::Path::new(&raw);
-            if p.is_absolute() {
-                PathBuf::from(p)
-            } else {
-                repo_path.join(p)
-            }
-        }
-        Ok(_) => return Err("Cannot resolve git exclude file path".to_string()),
-        Err(e) => return Err(format!("Cannot run git rev-parse: {e}")),
-    };
-    let existing = match std::fs::read_to_string(&exclude_path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("Cannot read git exclude file: {e}")),
-    };
-    if !existing.lines().any(|line| line.trim() == pattern) {
-        let mut content = existing;
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(pattern);
-        content.push('\n');
-        if let Some(parent) = exclude_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Cannot create exclude directory: {e}"))?;
-        }
-        std::fs::write(&exclude_path, content)
-            .map_err(|e| format!("Cannot write git exclude file: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Count the number of changed files in the post-apply working-tree diff
-/// against `base_ref`. Includes both tracked changes (modified, deleted) and
-/// untracked files (newly created), matching review-cli's diff computation.
-/// Returns 0 if git is unavailable or either command fails.
-fn count_changed_files(repo_path: &std::path::Path, base_ref: &str) -> u32 {
-    let tracked = Command::new("git")
-        .args(["diff", "--name-only", "-z", base_ref, "--"])
-        .current_dir(repo_path)
-        .output();
-    let untracked = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .current_dir(repo_path)
-        .output();
-
-    let tracked_stdout = match tracked {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return 0,
-    };
-    let untracked_stdout = match untracked {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return 0,
-    };
-
-    let mut paths: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    for chunk in tracked_stdout.split(|&b| b == 0) {
-        if !chunk.is_empty() {
-            paths.insert(chunk.to_vec());
-        }
-    }
-    for chunk in untracked_stdout.split(|&b| b == 0) {
-        if !chunk.is_empty() {
-            paths.insert(chunk.to_vec());
-        }
-    }
-    paths.len().try_into().unwrap_or(u32::MAX)
-}
-
-fn bounded(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .take(MAX_OUTPUT_CHARS)
-        .collect()
+fn bounded(bytes: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut chars = text.chars();
+    let output = chars.by_ref().take(MAX_OUTPUT_CHARS).collect();
+    (output, chars.next().is_some())
 }

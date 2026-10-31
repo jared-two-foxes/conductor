@@ -1,112 +1,162 @@
 # conductor
 
-A deterministic Rust coordinator for a code-writing Design agent. It consumes the **exact executor input authored by Design**, applies operations through the `executor` library, optionally formats affected files, runs verification commands, then invokes the `review-app` library. Conductor does not ask a model to interpret executor input, retry changes, or make design decisions.
+A deterministic Rust command runner. Conductor runs an explicit list of commands
+in order and stops at the first failure. It does not interpret command output,
+generate changes, retry commands, or choose the next action.
+
+Executor, Review, formatters, build tools, tests, and Git are external programs
+chosen by the caller. None of the Executor or Review libraries are linked into
+Conductor.
 
 ## Contract
 
-`conductor run --request workflow.json` or `conductor run --request -` (stdin).
+```sh
+conductor run --request workflow.json
+conductor run --request -
+```
 
-Example `workflow.json`:
+`-` reads the request JSON from stdin. Example `workflow.json`:
 
 ```json
 {
-  "schema": "conductor.request/v1",
-  "repository_path": "/absolute/path/to/project",
-  "execution": {
-    "operations": [
-      {"type": "create_file", "path": "example.txt", "content": "hello\n"},
-      {"type": "edit_file", "path": "example.txt", "edits": [{"oldText": "hello", "newText": "Hello"}]}
-    ]
-  },
-  "checks": [
-    {"name": "tests", "program": "cargo", "args": ["test", "--locked"]}
+  "schema": "conductor.request/v2",
+  "working_directory": "/absolute/path/to/project",
+  "commands": [
+    {"name": "apply", "program": "executor", "args": ["apply", "/absolute/path/to/executor-input.json"]},
+    {"name": "compile", "program": "cargo", "args": ["build", "--locked"]},
+    {"name": "tests", "program": "cargo", "args": ["test", "--locked", "specific_test"]},
+    {"name": "review", "program": "review-cli", "args": ["run", "--request", "/absolute/path/to/review-input.json"]},
+    {"name": "commit", "program": "./tools/checkpoint-verified-task", "args": []}
+  ]
+}
+```
+
+The final command illustrates a **caller-provided** checkpoint program, not a
+program supplied by Conductor. It can verify the reviewed tree and create a Git
+commit. A plain `git commit` command can also be used if the caller has already
+prepared the intended index and accepts the ordinary Git hooks and behaviour.
+If review exits nonzero, neither kind of commit command runs.
+
+The caller prepares each tool's request files before invocation, using that
+tool's own schema. Review's request specifies its repository, base/head refs,
+and requirements; its CLI flags control provider/model and review budgets.
+Conductor does not build those requests or supply defaults for them.
+
+### Execution rules
+
+- `working_directory` is a required, existing absolute directory. It need not be
+  a Git repository. It is resolved once before execution and is the working
+  directory for every child.
+- `commands` is required. An empty list succeeds without launching anything.
+- Each command requires a nonblank `name` and `program`; `args` defaults to `[]`.
+  Names are diagnostic labels, have no special meaning, and need not be unique.
+- The schema, directory, and every command are validated before the first child
+  starts. Unknown fields and NUL in programs/arguments are rejected. Executable
+  availability is checked when that command is launched, so an earlier command
+  can create an executable used later.
+- Programs run directly with literal argv, without a shell or interpolation.
+  Bare names use inherited `PATH`; explicit relative executable paths such as
+  `./tools/checkpoint` resolve from `working_directory`. Argument paths are
+  interpreted by the child, normally relative to that directory.
+- Children inherit Conductor's environment and receive closed stdin. Supply
+  tool input through files/arguments, or explicitly call a wrapper program if
+  another input mechanism is needed. This is sequencing, not a stdout pipeline.
+- Only exit code **0** permits the next command to run. Any nonzero exit,
+  termination by signal, or launch/wait error stops the sequence. No later
+  commands run, and no earlier side effects are rolled back.
+- There is no automatic retry, recovery replay, failure branch, timeout,
+  cancellation protocol, or workspace isolation. Commands are trusted and may
+  have arbitrary side effects. The caller owns recovery and source identity
+  checks, including ensuring a commit contains exactly the reviewed tree.
+
+### Result and exit codes
+
+Stdout contains one JSON result (`conductor.result/v2`). Child stdout/stderr are
+captured inside it, so child logs do not corrupt the result envelope.
+
+| Result status | Conductor exit | Meaning |
+| --- | --- | --- |
+| `PASSED` | 0 | Every command exited 0, or the list was empty. |
+| `FAILED` | 1 | A child exited nonzero or was terminated by a signal. |
+| `BLOCKED` | 2 | Invalid/unreadable input, or a command could not be run. |
+
+Conductor's exit code is independent of the child's code. For example, a review
+command exiting 2 produces `FAILED`, Conductor exit 1, and a recorded child
+`exit_code` of 2. Conductor does not interpret a review decision embedded in JSON;
+tools or wrappers must express failure through their process exit status.
+Clap handles help/version and CLI usage errors separately from workflow results.
+
+Example stopped result (no record is produced for the skipped commit command):
+
+```json
+{
+  "schema": "conductor.result/v2",
+  "status": "FAILED",
+  "phase": "commands",
+  "commands": [
+    {
+      "index": 0,
+      "name": "review",
+      "program": "review-cli",
+      "args": ["run", "--request", "review-input.json"],
+      "status": "FAILED",
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "changes requested",
+      "stdout_truncated": false,
+      "stderr_truncated": false,
+      "error": "Command 'review' failed (exit status: 2)"
+    }
   ],
-  "review": {
-    "requirements": "Add example.txt containing Hello",
-    "base_ref": "HEAD",
-    "model": "opencode/claude-sonnet-4.5"
-  }
+  "failed_command_index": 0,
+  "error": "Command 'review' failed (exit status: 2)"
 }
 ```
 
-`execution` is the executor library's input schema, passed through without translation. Operations may interleave exact-text edits and file/directory operations. Supported types are `create_file`, `edit_file`, `replace_file`, `delete_file`, `move_file`, `create_directory`, `delete_directory`, and `move_directory`. Each check is an **argv array**, not a shell command. Commands execute sequentially from the repository root. The reviewer sees `base_ref` versus `:working`, including uncommitted changes. Design should use a dedicated working tree to avoid mixing unrelated edits into the review.
+`phase` is `input` for validation/read/parse errors, `commands` for a stopped
+sequence, and `completed` for success. `failed_command_index` is zero-based and
+present only when an attempted command fails. `commands` contains each attempted
+command in order, including one that could not start. Launch errors have status
+`BLOCKED`, null `exit_code`, and an error message; signal termination has status
+`FAILED` and null `exit_code`. Earlier successful command results are retained.
 
-Output is one JSON object (`conductor.result/v1`) with `status`, `phase`, executor outcome, per-file formatter results, completed check results, review result, and optional error:
+Each output stream is decoded as lossy UTF-8 and limited in the result to 16,384
+characters, with a separate truncation flag. Full process output is still
+captured in memory before truncation; this is not a process-memory bound. Tools
+should write full machine-readable reports/receipts to files when needed rather
+than relying on potentially truncated stdout.
 
-- `PASSED` (exit 0): all operations, selected formatters and checks succeeded, and review approved.
-- `NEEDS_DESIGN` (exit 2): an operation failed, a formatter failed or emitted invalid output, a check failed, or review requested changes. Prior file changes are **not rolled back**.
-- `BLOCKED` (exit 3): invalid input, unavailable formatter/check command, formatting filesystem or target-change errors, or indeterminate/unavailable review. No AI retry is attempted.
+## Migration from v1
 
-Failures always return to Design. Conductor never rewrites or regenerates operations.
+This is a breaking change, released as 0.2.0 with **v2 request/result schemas**.
+Legacy requests are rejected before any commands run. There is no compatibility
+mode that implicitly calls Executor or Review.
 
-### Exact-text edits and patch migration
+| Previous built-in behaviour | Caller responsibility in v2 |
+| --- | --- |
+| `repository_path` | Set `working_directory`. |
+| `execution` through the Executor library | Write Executor input and add its CLI invocation. |
+| Affected-file formatter rules | Add formatter invocations or a wrapper selecting the intended files. |
+| `checks` | Put those commands in the desired order in `commands`. |
+| `review` through the Review library | Write Review input and add its CLI invocation, including desired limits. |
+| Scaled review budgets and `.conductor` ledger setup | Choose Review flags/ledger location and Git exclusions in the caller. |
+| Typed execution/formatting/review results | Read each tool's output or report file; Conductor records generic process results. |
+| `NEEDS_DESIGN` versus `BLOCKED` domain classification | Interpret tool-specific outcomes outside Conductor. |
 
-`edit_file` applies literal `oldText`/`newText` replacements to an existing regular UTF-8 file. Every `oldText` must be non-empty and match exactly once, and edit ranges must not overlap. All edits in one operation resolve against the same original contents at the start of that operation, after earlier operations have completed. No whitespace or line-ending normalization occurs. Match validation completes before that operation writes the file; earlier successful operations are not rolled back on failure.
-
-**Breaking input change:** the former `patch` operation, including both inline and file-source forms, is no longer accepted. Conductor does not import or translate unified diffs. Replace localized patches with `edit_file`, use `replace_file` for hash-guarded whole-file replacement, and use explicit file/directory operations for structural changes. A legacy patch anywhere in a request fails deserialization before execution: the CLI returns `BLOCKED` with `phase: "input"`, and no operations run. The `conductor.request/v1` and `conductor.result/v1` envelope names are unchanged.
-
-### Affected-file reporting
-
-The nested `execution` outcome now always includes `affected_files`, for example:
-
-```json
-{
-  "success": true,
-  "operations_applied": 2,
-  "affected_files": ["example.txt"]
-}
-```
-
-Only a fully successful execution batch populates this list. Paths are sorted, unique, repository-relative, use `/` separators, and identify surviving affected regular files at their final locations. Files targeted by identical-content edits and files relocated by directory moves are included; deleted files, directories, symlinks, and unrelated pre-existing working-tree changes are not. Empty batches and every execution failure, including partial application, report `[]`; earlier changes remain applied. The list is not a Git baseline diff or a partial-execution recovery ledger. Later check or review failures do not erase the outcome of a successful execution.
-
-Conductor exposes Executor's metadata unchanged, including when a later formatting phase fails. Consumers that reject unknown output fields must allow `execution.affected_files`. Rebuild and replace installed Conductor binaries before sending `edit_file` requests; changing this repository's dependency alone does not upgrade an installed binary.
-
-### Formatting affected files
-
-An optional `formatters` array in `conductor.request/v1` enables formatting after the entire Executor batch succeeds and before checks and review:
-
-```json
-"formatters": [
-  {
-    "name": "rust",
-    "extensions": ["rs"],
-    "program": "rustfmt",
-    "args": ["--edition", "2024", "--emit", "stdout", "--config-path", "{parent}"]
-  },
-  {
-    "name": "prettier",
-    "extensions": ["js", "ts", "tsx"],
-    "program": "prettier",
-    "args": ["--stdin-filepath", "{path}"]
-  }
-]
-```
-
-Rules are explicit, not discovered by Conductor. Missing or empty `formatters` leaves existing behavior unchanged. Each rule requires a nonblank name/program and a nonempty list of plain extensions without dots, separators or whitespace; `args` defaults to `[]`. Extensions match the final filename suffix case-insensitively. Duplicate extension assignments, including within a rule, are rejected during input validation before any operations run. Unknown rule fields are rejected. Unmatched files and rules with no matching affected files cause no formatter invocation. Rules run in declaration order and their matching paths in sorted, deduplicated order.
-
-Only surviving paths from the successful `execution.affected_files` are candidates. Conductor does not discover targets from Git status or the review baseline. For each file, it sends the complete UTF-8 source on stdin and treats complete stdout as the replacement source. No filename is automatically appended. Commands use argv, not a shell, and run from the repository root. Relative executable paths such as `./tools/formatter` are resolved from that root; bare executable names use PATH. Whole arguments `{path}` and `{parent}` expand to the repository-relative target and its parent directory (`.` for root files). Embedded placeholders such as `--file={path}` remain literal. These arguments supply configuration/parser context, not permission to rewrite extra files. Configure the Rust edition explicitly or through rustfmt configuration; Conductor does not infer it from Cargo manifests.
-
-Formatters must emit only formatted source on stdout, not check-mode output, diffs or logs. Source is never truncated; diagnostics are bounded. Nonzero exit, invalid UTF-8 stdout or empty stdout for nonempty input returns `NEEDS_DESIGN` at phase `formatting` without replacing that file. Empty input may produce empty output. Unchanged output causes no rewrite. Conductor revalidates safe regular-file paths (including symlink/reparse-point protections) and compares current contents with the original input before committing. Changed output is written to a temporary sibling and replaces only the target, preserving permissions and avoiding writes through hard links. This is per-file replacement, not a batch transaction or a crash-durability guarantee.
-
-Launch, source-read, replacement and target-change errors return `BLOCKED` at phase `formatting`. Any failure stops later formatting, checks and review, while preserving earlier execution and formatting changes. There is no rollback or retry. Executor's affected-file metadata is not rewritten; checks and review see the formatted working tree.
-
-The result always includes a `formatters` array, empty when no files were attempted. Each attempted file records `name`, `path`, `program`, expanded `args`, `exit_code` (null when unavailable), `changed`, and bounded `stderr`. Formatted source is not duplicated in results. Output consumers rejecting unknown fields must allow this new array. The v1 envelope names are unchanged; Rust consumers constructing `WorkflowRequest`/`WorkflowResult` literals must accommodate their new fields.
-
-Formatter executables and plugins remain trusted, not sandboxed: stdin/stdout invocation limits Conductor's own writes, not arbitrary command side effects. Target checks below the resolved repository root are optimistic, not filesystem locking. Ordinary target renames, removals or content changes detected before replacement return a formatting error; Conductor does not search for moved targets or recreate them. The repository root and its ancestor directories must remain stable throughout the workflow. Concurrent root/ancestor relocation, redirection or replacement (including a different directory with identical target contents) is explicitly out of scope; no directory-identity tracking or adversarial filesystem isolation is provided. Output is captured in memory and there are no process timeouts or output-size limits. Pi/OpenCode adapters do not yet expose formatter rules; this feature is available through the library and CLI workflow request. Adapter changes and installation are separate work.
+Existing Pi/OpenCode adapters expecting v1 must be migrated before upgrading
+their installed Conductor binary. In particular, callers must retain tool
+evidence and source-tree validation required by their task/checkpoint protocol.
+An arbitrary post-review command is not a replacement for those validations.
+This repository changes only Conductor; adapter migration is separate work.
 
 ## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo run -- run --request workflow.json
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-Formatting tests compile a portable Rust subprocess fixture with `rustc` and exercise stdin-mode `rustfmt`; install the rustfmt component (as CI does).
-
-Dependencies are the reusable Rust libraries from [executor](https://github.com/jared-two-foxes/executor) and [review](https://github.com/jared-two-foxes/review); neither CLI is spawned. The reviewer uses the credentials/provider configuration supported by `review-app`.
-
-## Scope of the first version
-
-The first version provides one execution/check/review pass and a test seam for injecting a deterministic reviewer. It does not implement process timeouts, cancellation, workspace isolation, automated retries, OpenCode/Pi adapters, or a persistent workflow ledger. Run untrusted verification commands only in a suitably isolated environment. A subsequent change should add per-check timeouts and cancellation before unattended use.
+Integration tests compile a small portable Rust subprocess fixture with `rustc`
+and exercise real command ordering, failure propagation, CLI JSON, working
+directory/argv handling, and output capture. CI runs on Linux and Windows.
