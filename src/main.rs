@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand};
-use conductor::{Status, WorkflowRequest, WorkflowResult, run};
+use conductor::{WorkflowRequest, WorkflowResult, run};
 use std::fs;
 use std::io::{self, Read};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(version, about = "Apply changes, verify, and review deterministically")]
+#[command(
+    version,
+    about = "Run commands sequentially, stopping at the first failure"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -37,11 +40,7 @@ fn main() -> ExitCode {
         },
         Err(error) => WorkflowResult::blocked("input", format!("Cannot read request: {error}")),
     };
-    let exit = match outcome.status {
-        Status::Passed => ExitCode::SUCCESS,
-        Status::NeedsDesign => ExitCode::from(2),
-        Status::Blocked => ExitCode::from(3),
-    };
+    let exit = ExitCode::from(outcome.status.exit_code());
     println!(
         "{}",
         serde_json::to_string(&outcome).expect("WorkflowResult is serializable")
