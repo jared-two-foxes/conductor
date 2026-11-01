@@ -35,6 +35,120 @@ fn command(name: &str, args: &[&str]) -> Value {
     json!({"name": name, "program": fixture(), "args": args})
 }
 
+fn conditioned(name: &str, args: &[&str], mode: &str, value: &str) -> Value {
+    json!({"name": name, "program": fixture(), "args": args,
+        "success_condition": {"program": fixture(), "args": ["condition", name, "0", mode, value]}})
+}
+
+#[test]
+fn condition_can_reject_zero_exit_using_complete_output() {
+    let dir = tempdir().unwrap();
+    let first = conditioned(
+        "cargo test",
+        &["record", "journal", "test failure", "0"],
+        "output-excludes",
+        "failure",
+    );
+    let result = run_value(request(
+        dir.path(),
+        vec![
+            first,
+            command("skipped", &["record", "journal", "next", "0"]),
+        ],
+    ));
+    assert_eq!(result.status, Status::Failed);
+    assert_eq!(result.failed_command_index, Some(0));
+    assert_eq!(result.commands.len(), 1);
+    let command = &result.commands[0];
+    assert_eq!(command.exit_code, Some(0));
+    assert_eq!(command.status, Status::Failed);
+    let condition = command.condition.as_ref().unwrap();
+    assert_eq!(condition.status, Status::Failed);
+    assert_eq!(condition.exit_code, Some(7));
+    assert!(
+        fs::read_to_string(condition.stderr_path.as_ref().unwrap())
+            .unwrap()
+            .contains("rejected")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("journal")).unwrap(),
+        "test failure\n"
+    );
+}
+
+#[test]
+fn condition_can_accept_nonzero_exit_and_continue_using_state() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("new-directory");
+    let first = conditioned(
+        "search",
+        &["record", "journal", "directory missing", "1"],
+        "directory-absent",
+        target.to_str().unwrap(),
+    );
+    let second = command("create", &["create-directory", target.to_str().unwrap()]);
+    let result = run_value(request(dir.path(), vec![first, second]));
+    assert_eq!(result.status, Status::Passed);
+    assert_eq!(result.commands[0].exit_code, Some(1));
+    assert_eq!(result.commands[0].status, Status::Passed);
+    assert_eq!(
+        result.commands[0].condition.as_ref().unwrap().exit_code,
+        Some(0)
+    );
+    assert!(target.is_dir());
+}
+
+#[test]
+fn condition_reads_complete_output_beyond_the_result_preview() {
+    let dir = tempdir().unwrap();
+    let first = conditioned(
+        "report",
+        &["report"],
+        "output-contains",
+        "failure details at end",
+    );
+    let result = run_value(request(
+        dir.path(),
+        vec![
+            first,
+            command("next", &["record", "journal", "continued", "0"]),
+        ],
+    ));
+    assert_eq!(result.status, Status::Passed);
+    assert_eq!(result.commands[0].exit_code, Some(2));
+    assert!(result.commands[0].stdout_truncated);
+    assert!(!result.commands[0].stdout.contains("failure details at end"));
+    assert_eq!(
+        result.commands[0].condition.as_ref().unwrap().status,
+        Status::Passed
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("journal")).unwrap(),
+        "continued\n"
+    );
+}
+
+#[test]
+fn condition_launch_failure_blocks_and_does_not_continue() {
+    let dir = tempdir().unwrap();
+    let mut first = command("check", &["record", "journal", "done", "0"]);
+    first["success_condition"] = json!({"program": "missing-conductor-condition-executable"});
+    let result = run_value(request(
+        dir.path(),
+        vec![
+            first,
+            command("skipped", &["record", "journal", "next", "0"]),
+        ],
+    ));
+    assert_eq!(result.status, Status::Blocked);
+    assert_eq!(result.commands[0].exit_code, Some(0));
+    assert_eq!(
+        result.commands[0].condition.as_ref().unwrap().status,
+        Status::Blocked
+    );
+    assert_eq!(result.commands.len(), 1);
+}
+
 fn request(directory: &Path, commands: Vec<Value>) -> Value {
     json!({
         "schema": "conductor.request/v2",
@@ -550,6 +664,19 @@ fn cli_rejects_legacy_and_unknown_fields_before_any_command_runs() {
     let mut unknown_command_field = valid;
     unknown_command_field["commands"][0]["on_failure"] = json!("continue");
     invalid_requests.push(unknown_command_field);
+    for condition in [
+        json!({"program": ""}),
+        json!({"program": "ok\u{0}bad"}),
+        json!({"program": "ok", "args": ["bad\u{0}arg"]}),
+        json!({"program": "ok", "unknown": true}),
+    ] {
+        let mut value = request(
+            dir.path(),
+            vec![command("unused", &["record", "journal", "unused", "0"])],
+        );
+        value["commands"][0]["success_condition"] = condition;
+        invalid_requests.push(value);
+    }
     for value in invalid_requests {
         let output = cli_stdin(&value);
         assert_eq!(output.status.code(), Some(2));

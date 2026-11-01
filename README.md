@@ -1,7 +1,9 @@
 # conductor
 
 A deterministic Rust command runner. Conductor runs an explicit list of commands
-in order and stops at the first failure. It does not interpret command output,
+in order and stops at the first failure. By default it uses process exit status;
+an optional caller-supplied evaluator can decide success from a command's complete
+output and exit code. Conductor itself does not interpret tool-specific output,
 generate changes, retry commands, or choose the next action.
 
 Executor, Review, formatters, build tools, tests, and Git are external programs
@@ -66,13 +68,61 @@ Conductor does not build those requests or supply defaults for them.
 - Children inherit Conductor's environment and receive closed stdin. Supply
   tool input through files/arguments, or explicitly call a wrapper program if
   another input mechanism is needed. This is sequencing, not a stdout pipeline.
-- Only exit code **0** permits the next command to run. Any nonzero exit,
-  termination by signal, or launch/wait error stops the sequence. No later
-  commands run, and no earlier side effects are rolled back.
+- By default, only exit code **0** permits the next command to run. A command
+  with `success_condition` instead continues only when that evaluator exits 0.
+  The evaluator runs after a normally exited command, even if its exit code was
+  nonzero. Termination by signal or launch/wait error stops without evaluation.
+  No later commands run, and no earlier side effects are rolled back.
 - There is no automatic retry, recovery replay, failure branch, timeout,
   cancellation protocol, or workspace isolation. Commands are trusted and may
   have arbitrary side effects. The caller owns recovery and source identity
   checks, including ensuring a commit contains exactly the reviewed tree.
+
+### Custom success conditions
+
+Add `success_condition` to a command when exit status alone does not express
+the policy. It has `program` and optional `args`, just like a command. The
+evaluator runs directly with literal argv, closed stdin, and the same working
+directory. Its program may be a caller-provided script or executable. It
+receives these environment variables, overriding inherited values:
+
+| Variable | Value |
+| --- | --- |
+| `CONDUCTOR_COMMAND_EXIT_CODE` | Original command's numeric exit code. |
+| `CONDUCTOR_COMMAND_STDOUT_PATH` | Absolute path to complete raw stdout. |
+| `CONDUCTOR_COMMAND_STDERR_PATH` | Absolute path to complete raw stderr. |
+| `CONDUCTOR_COMMAND_INDEX` | Zero-based position in the list. |
+| `CONDUCTOR_COMMAND_NAME` | Command's diagnostic label. |
+
+For example, `tools/check-test-output` can read the full output to reject a
+zero-exit test run that contains failures:
+
+```json
+{"name":"tests","program":"cargo","args":["test","--locked"],
+ "success_condition":{"program":"./tools/check-test-output","args":[]}}
+```
+
+An absence check can accept a command's nonzero exit, then continue to create
+the directory. Here `tools/accept-absence` reads the original exit code and
+checks that `build/cache` does not exist:
+
+```json
+[
+  {"name":"search","program":"test","args":["-d","build/cache"],
+   "success_condition":{"program":"./tools/accept-absence","args":["build/cache"]}},
+  {"name":"create","program":"mkdir","args":["build/cache"]}
+]
+```
+
+The evaluator's exit 0 means `PASSED`; a nonzero exit or signal means `FAILED`;
+failure to launch or retain its logs means `BLOCKED`. Its stdout/stderr get
+separate complete files (`000000.condition.stdout` and `.stderr`), bounded
+previews, exit code, status, and error under the command result's optional
+`condition` field. The original command's `exit_code` remains unchanged, so
+the caller can distinguish a rejected zero-exit run from an accepted nonzero
+run. Evaluators are trusted local programs and can have side effects; keep
+their policy explicit and deterministic. Their log paths are available for
+diagnosis, but logs are not immutable evidence.
 
 ### Result and exit codes
 
@@ -82,14 +132,14 @@ so child logs do not corrupt the result envelope or accumulate in memory.
 
 | Result status | Conductor exit | Meaning |
 | --- | --- | --- |
-| `PASSED` | 0 | Every command exited 0, or the list was empty. |
-| `FAILED` | 1 | A child exited nonzero or was terminated by a signal. |
-| `BLOCKED` | 2 | Invalid/unreadable input, a command could not be run, or log setup/reading failed. |
+| `PASSED` | 0 | Every command satisfied its success condition (default: exit 0), or the list was empty. |
+| `FAILED` | 1 | A command or its evaluator rejected success, or was terminated by a signal. |
+| `BLOCKED` | 2 | Invalid/unreadable input, a command or evaluator could not run, or log setup/reading failed. |
 
 Conductor's exit code is independent of the child's code. For example, a review
 command exiting 2 produces `FAILED`, Conductor exit 1, and a recorded child
 `exit_code` of 2. Conductor does not interpret a review decision embedded in JSON;
-tools or wrappers must express failure through their process exit status.
+the tool or its evaluator must express that decision through its process status.
 Clap handles help/version and CLI usage errors separately from workflow results.
 
 Example stopped result (no record is produced for the skipped commit command):
@@ -182,6 +232,9 @@ local files, not an immutable evidence store or a crash-durability guarantee.
 This is an additive extension of v2. Existing requests still work without
 `output_directory`; output consumers that reject unknown fields must allow the
 new top-level `output_directory` and command `stdout_path`/`stderr_path` fields.
+Custom conditions are also optional in v2; consumers using them must allow a
+command result's `condition` field and must use its evaluated `status` rather
+than assuming `exit_code == 0` whenever `status == PASSED`.
 
 ## Migration from v1
 
