@@ -28,9 +28,21 @@ pub struct CommandSpec {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional external evaluator. Its exit status, rather than the command's,
+    /// determines whether the sequence continues.
+    #[serde(default)]
+    pub success_condition: Option<ConditionSpec>,
 }
 
-#[derive(Serialize, PartialEq, Eq, Debug)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionSpec {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
     Passed,
@@ -53,6 +65,26 @@ impl Status {
 pub struct CommandResult {
     pub index: usize,
     pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub status: Status,
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<ConditionResult>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ConditionResult {
     pub program: String,
     pub args: Vec<String>,
     pub status: Status,
@@ -131,6 +163,7 @@ pub fn run(request: &WorkflowRequest) -> WorkflowResult {
             args: command.args.clone(),
             status: Status::Blocked,
             exit_code: None,
+            condition: None,
             stdout: String::new(),
             stderr: String::new(),
             stdout_truncated: false,
@@ -193,6 +226,15 @@ fn validate(request: &WorkflowRequest) -> Result<PathBuf, String> {
         if command.program.contains('\0') || command.args.iter().any(|arg| arg.contains('\0')) {
             return Err(format!(
                 "Command {index}: program and args must not contain NUL"
+            ));
+        }
+        if let Some(condition) = &command.success_condition
+            && (condition.program.trim().is_empty()
+                || condition.program.contains('\0')
+                || condition.args.iter().any(|arg| arg.contains('\0')))
+        {
+            return Err(format!(
+                "Command {index}: invalid success_condition program or args"
             ));
         }
     }
@@ -277,7 +319,93 @@ fn execute_command(
         .map_err(|error| format!("Cannot read stdout log {}: {error}", stdout_path.display()))?;
     (record.stderr, record.stderr_truncated) = preview(&stderr_path)
         .map_err(|error| format!("Cannot read stderr log {}: {error}", stderr_path.display()))?;
+    if let Some(condition) = &command.success_condition
+        && record.exit_code.is_some()
+    {
+        let evaluated = evaluate_condition(
+            directory,
+            logs,
+            condition,
+            record,
+            &stdout_path,
+            &stderr_path,
+        );
+        record.status = evaluated.status.clone();
+        record.error = evaluated.error.clone();
+        record.condition = Some(evaluated);
+    }
     Ok(())
+}
+
+fn evaluate_condition(
+    directory: &Path,
+    logs: &Path,
+    spec: &ConditionSpec,
+    command: &CommandResult,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> ConditionResult {
+    let mut result = ConditionResult {
+        program: spec.program.clone(),
+        args: spec.args.clone(),
+        status: Status::Blocked,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        stdout_path: None,
+        stderr_path: None,
+        error: None,
+    };
+    let evaluated = (|| -> Result<(), String> {
+        let out_path = logs.join(format!("{:06}.condition.stdout", command.index));
+        let err_path = logs.join(format!("{:06}.condition.stderr", command.index));
+        let out = File::create_new(&out_path)
+            .map_err(|error| format!("Cannot create condition stdout log: {error}"))?;
+        result.stdout_path = Some(out_path.clone());
+        let err = File::create_new(&err_path)
+            .map_err(|error| format!("Cannot create condition stderr log: {error}"))?;
+        result.stderr_path = Some(err_path.clone());
+        let status = Command::new(resolve_program(directory, &spec.program))
+            .args(&spec.args)
+            .current_dir(directory)
+            .env(
+                "CONDUCTOR_COMMAND_EXIT_CODE",
+                command.exit_code.unwrap().to_string(),
+            )
+            .env("CONDUCTOR_COMMAND_STDOUT_PATH", stdout_path)
+            .env("CONDUCTOR_COMMAND_STDERR_PATH", stderr_path)
+            .env("CONDUCTOR_COMMAND_INDEX", command.index.to_string())
+            .env("CONDUCTOR_COMMAND_NAME", &command.name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .status()
+            .map_err(|error| format!("Cannot run success condition: {error}"))?;
+        result.exit_code = status.code();
+        result.status = if status.success() {
+            Status::Passed
+        } else {
+            Status::Failed
+        };
+        if !status.success() {
+            result.error = Some(format!(
+                "Success condition for '{}' failed ({status})",
+                command.name
+            ));
+        }
+        (result.stdout, result.stdout_truncated) = preview(&out_path)
+            .map_err(|error| format!("Cannot read condition stdout log: {error}"))?;
+        (result.stderr, result.stderr_truncated) = preview(&err_path)
+            .map_err(|error| format!("Cannot read condition stderr log: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = evaluated {
+        result.status = Status::Blocked;
+        result.error = Some(error);
+    }
+    result
 }
 
 fn preview(path: &Path) -> IoResult<(String, bool)> {
