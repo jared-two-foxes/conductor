@@ -3,8 +3,10 @@
 //! of source changes, verification, review, Git, or task lifecycle policy.
 
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const MAX_OUTPUT_CHARS: usize = 16_384;
 
@@ -13,6 +15,9 @@ const MAX_OUTPUT_CHARS: usize = 16_384;
 pub struct WorkflowRequest {
     pub schema: String,
     pub working_directory: PathBuf,
+    /// Existing absolute parent for per-run logs. Defaults to the system temp directory.
+    #[serde(default)]
+    pub output_directory: Option<PathBuf>,
     pub commands: Vec<CommandSpec>,
 }
 
@@ -57,6 +62,10 @@ pub struct CommandResult {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -66,6 +75,9 @@ pub struct WorkflowResult {
     pub status: Status,
     pub phase: &'static str,
     pub commands: Vec<CommandResult>,
+    /// Unique run directory, retained after return for caller-managed cleanup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_directory: Option<PathBuf>,
     /// Zero-based index of the command that failed or could not be started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_command_index: Option<usize>,
@@ -80,6 +92,7 @@ impl WorkflowResult {
             status: Status::Blocked,
             phase,
             commands: Vec::new(),
+            output_directory: None,
             failed_command_index: None,
             error: Some(error.into()),
         }
@@ -98,17 +111,19 @@ pub fn run(request: &WorkflowRequest) -> WorkflowResult {
         status: Status::Passed,
         phase: "completed",
         commands: Vec::new(),
+        output_directory: None,
         failed_command_index: None,
         error: None,
     };
+    if request.commands.is_empty() {
+        return output;
+    }
+    let logs = match create_run_directory(request.output_directory.as_deref()) {
+        Ok(logs) => logs,
+        Err(error) => return WorkflowResult::blocked("output", error),
+    };
+    output.output_directory = Some(logs.clone());
     for (index, command) in request.commands.iter().enumerate() {
-        // Bare names use PATH. Explicit relative executable paths are resolved
-        // before setting current_dir, avoiding platform-dependent resolution.
-        let program = resolve_program(&directory, &command.program);
-        let result = Command::new(program)
-            .args(&command.args)
-            .current_dir(&directory)
-            .output();
         let mut record = CommandResult {
             index,
             name: command.name.clone(),
@@ -120,26 +135,16 @@ pub fn run(request: &WorkflowRequest) -> WorkflowResult {
             stderr: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_path: None,
+            stderr_path: None,
             error: None,
         };
-        match result {
-            Ok(result) => {
-                record.exit_code = result.status.code();
-                (record.stdout, record.stdout_truncated) = bounded(&result.stdout);
-                (record.stderr, record.stderr_truncated) = bounded(&result.stderr);
-                record.status = if result.status.success() {
-                    Status::Passed
-                } else {
-                    record.error = Some(format!(
-                        "Command '{}' failed ({})",
-                        command.name, result.status
-                    ));
-                    Status::Failed
-                };
-            }
-            Err(error) => {
-                record.error = Some(format!("Cannot run command '{}': {error}", command.name));
-            }
+        if let Err(error) = execute_command(&directory, &logs, command, &mut record) {
+            record.status = Status::Blocked;
+            record.error = Some(match record.error.take() {
+                Some(previous) => format!("{previous}; {error}"),
+                None => error,
+            });
         }
         let succeeded = record.status == Status::Passed;
         if !succeeded {
@@ -174,6 +179,11 @@ fn validate(request: &WorkflowRequest) -> Result<PathBuf, String> {
     if !directory.is_dir() {
         return Err("working_directory must be a directory".into());
     }
+    if let Some(parent) = &request.output_directory
+        && (!parent.is_absolute() || !parent.is_dir())
+    {
+        return Err("output_directory must be an existing absolute directory".into());
+    }
     for (index, command) in request.commands.iter().enumerate() {
         if command.name.trim().is_empty() || command.program.trim().is_empty() {
             return Err(format!(
@@ -198,9 +208,88 @@ fn resolve_program(directory: &Path, program: &str) -> PathBuf {
     }
 }
 
-fn bounded(bytes: &[u8]) -> (String, bool) {
-    let text = String::from_utf8_lossy(bytes);
+fn create_run_directory(parent: Option<&Path>) -> Result<PathBuf, String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("conductor-");
+    let dir = match parent {
+        Some(parent) => builder.tempdir_in(parent),
+        None => builder.tempdir(),
+    }
+    .map_err(|error| format!("Cannot create command output directory: {error}"))?;
+    let path = dir
+        .path()
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve command output directory: {error}"))?;
+    // The caller owns retention/cleanup; do not delete logs when the run ends.
+    let _ = dir.keep();
+    Ok(path)
+}
+
+fn execute_command(
+    directory: &Path,
+    logs: &Path,
+    command: &CommandSpec,
+    record: &mut CommandResult,
+) -> Result<(), String> {
+    let stdout_path = logs.join(format!("{:06}.stdout", record.index));
+    let stderr_path = logs.join(format!("{:06}.stderr", record.index));
+    let stdout = File::create_new(&stdout_path).map_err(|error| {
+        format!(
+            "Cannot create stdout log {}: {error}",
+            stdout_path.display()
+        )
+    })?;
+    record.stdout_path = Some(stdout_path.clone());
+    let stderr = File::create_new(&stderr_path).map_err(|error| {
+        format!(
+            "Cannot create stderr log {}: {error}",
+            stderr_path.display()
+        )
+    })?;
+    record.stderr_path = Some(stderr_path.clone());
+
+    // Redirect to files, not pipes: output size must not determine memory use.
+    // Resolve explicit relative programs before current_dir for portable behaviour.
+    let result = Command::new(resolve_program(directory, &command.program))
+        .args(&command.args)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status();
+    match result {
+        Ok(status) => {
+            record.exit_code = status.code();
+            record.status = if status.success() {
+                Status::Passed
+            } else {
+                Status::Failed
+            };
+            if !status.success() {
+                record.error = Some(format!("Command '{}' failed ({status})", command.name));
+            }
+        }
+        Err(error) => {
+            record.error = Some(format!("Cannot run command '{}': {error}", command.name));
+        }
+    }
+    (record.stdout, record.stdout_truncated) = preview(&stdout_path)
+        .map_err(|error| format!("Cannot read stdout log {}: {error}", stdout_path.display()))?;
+    (record.stderr, record.stderr_truncated) = preview(&stderr_path)
+        .map_err(|error| format!("Cannot read stderr log {}: {error}", stderr_path.display()))?;
+    Ok(())
+}
+
+fn preview(path: &Path) -> IoResult<(String, bool)> {
+    // A Unicode scalar occupies at most four UTF-8 bytes. Reading this much
+    // guarantees enough decoded characters to decide truncation, even for
+    // four-byte scalars, while preserving bounded memory for arbitrary logs.
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take((4 * (MAX_OUTPUT_CHARS + 1)) as u64)
+        .read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut chars = text.chars();
     let output = chars.by_ref().take(MAX_OUTPUT_CHARS).collect();
-    (output, chars.next().is_some())
+    Ok((output, chars.next().is_some()))
 }

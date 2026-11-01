@@ -39,6 +39,7 @@ fn request(directory: &Path, commands: Vec<Value>) -> Value {
     json!({
         "schema": "conductor.request/v2",
         "working_directory": directory,
+        "output_directory": directory,
         "commands": commands
     })
 }
@@ -87,6 +88,14 @@ fn runs_arbitrary_commands_in_order_and_captures_diagnostics() {
         assert_eq!(record.index, index);
         assert_eq!(record.status, Status::Passed);
         assert_eq!(record.exit_code, Some(0));
+        assert_eq!(
+            fs::read(record.stdout_path.as_ref().unwrap()).unwrap(),
+            record.stdout.as_bytes()
+        );
+        assert_eq!(
+            fs::read(record.stderr_path.as_ref().unwrap()).unwrap(),
+            record.stderr.as_bytes()
+        );
         assert_eq!(
             record.stdout.trim_end(),
             format!("stdout: {}", labels[index])
@@ -144,6 +153,20 @@ fn unavailable_command_is_recorded_and_stops_the_sequence() {
     assert_eq!(result.failed_command_index, Some(1));
     assert_eq!(result.commands.len(), 2);
     assert_eq!(result.commands[1].exit_code, None);
+    for path in [
+        &result.commands[1].stdout_path,
+        &result.commands[1].stderr_path,
+    ] {
+        assert!(fs::read(path.as_ref().unwrap()).unwrap().is_empty());
+    }
+    assert!(
+        !result
+            .output_directory
+            .as_ref()
+            .unwrap()
+            .join("000002.stdout")
+            .exists()
+    );
     assert!(
         result.commands[1]
             .error
@@ -196,6 +219,7 @@ fn requires_an_existing_absolute_directory_but_not_a_git_repository() {
     let result = run_value(request(dir.path(), vec![]));
     assert_eq!(result.status, Status::Passed);
     assert!(result.commands.is_empty());
+    assert!(result.output_directory.is_none());
 }
 
 #[test]
@@ -269,6 +293,208 @@ fn output_is_lossy_utf8_bounded_and_explicitly_marked_when_truncated() {
     assert!(record.stdout.chars().all(|c| c == 'é'));
     assert!(record.stderr.chars().all(|c| c == '\u{fffd}'));
     assert!(record.stdout_truncated && record.stderr_truncated);
+    assert_eq!(
+        fs::read(record.stdout_path.as_ref().unwrap()).unwrap(),
+        "é".repeat(17_000).as_bytes()
+    );
+    assert_eq!(
+        fs::read(record.stderr_path.as_ref().unwrap()).unwrap(),
+        vec![0xff; 17_000]
+    );
+}
+
+#[test]
+fn cli_retains_large_structured_output_and_failure_tail_after_exit() {
+    let dir = tempdir().unwrap();
+    let output = cli_stdin(&request(
+        dir.path(),
+        vec![
+            command("review", &["report"]),
+            command("commit", &["record", "journal", "must-not-run", "0"]),
+        ],
+    ));
+    assert_eq!(output.status.code(), Some(1));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "FAILED");
+    assert_eq!(result["failed_command_index"], 0);
+    let records = result["commands"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record["exit_code"], 2);
+    assert_eq!(record["stdout_truncated"], true);
+    assert_eq!(record["stderr_truncated"], true);
+    assert!(!record["stderr"].as_str().unwrap().contains("FAILURE"));
+    let stdout = Path::new(record["stdout_path"].as_str().unwrap());
+    let stderr = Path::new(record["stderr_path"].as_str().unwrap());
+    assert!(stdout.is_absolute() && stderr.is_absolute());
+    // Read only after the CLI process has exited: full JSON remains parseable.
+    let report: Value = serde_json::from_slice(&fs::read(stdout).unwrap()).unwrap();
+    assert_eq!(report["padding"].as_str().unwrap().len(), 100_000);
+    assert_eq!(report["findings"][0]["message"], "failure details at end");
+    assert!(
+        fs::read_to_string(stderr)
+            .unwrap()
+            .ends_with("FAILURE: expected 42, got 7\n")
+    );
+    assert!(!dir.path().join("journal").exists());
+    assert!(!stdout.parent().unwrap().join("000001.stdout").exists());
+}
+
+#[test]
+fn previews_respect_character_boundaries_and_detect_exact_limit() {
+    let dir = tempdir().unwrap();
+    for character in ["a", "é", "😀"] {
+        for count in [16_383, 16_384, 16_385] {
+            let result = run_value(request(
+                dir.path(),
+                vec![command(
+                    "repeat",
+                    &["repeat", character, &count.to_string()],
+                )],
+            ));
+            assert_eq!(result.status, Status::Passed);
+            let record = &result.commands[0];
+            assert_eq!(record.stdout, character.repeat(count.min(16_384)));
+            assert_eq!(record.stdout_truncated, count > 16_384);
+            assert_eq!(
+                fs::read(record.stdout_path.as_ref().unwrap()).unwrap(),
+                character.repeat(count).as_bytes()
+            );
+            assert!(record.stderr.is_empty() && !record.stderr_truncated);
+        }
+    }
+}
+
+#[test]
+fn output_directories_are_unique_and_names_do_not_control_paths() {
+    let dir = tempdir().unwrap();
+    let logs = tempdir().unwrap();
+    let mut value = request(
+        dir.path(),
+        vec![
+            command("../same", &["echo", "first"]),
+            command("../same", &["echo", "second"]),
+        ],
+    );
+    value["output_directory"] = json!(logs.path());
+    let first = run_value(value.clone());
+    let second = run_value(value);
+    assert_eq!(first.status, Status::Passed);
+    assert_eq!(second.status, Status::Passed);
+    assert_ne!(first.output_directory, second.output_directory);
+    for result in [&first, &second] {
+        let run_dir = result.output_directory.as_ref().unwrap();
+        assert!(run_dir.starts_with(logs.path().canonicalize().unwrap()));
+        assert_eq!(fs::read_dir(run_dir).unwrap().count(), 4);
+        for (index, record) in result.commands.iter().enumerate() {
+            assert_eq!(
+                record.stdout_path.as_ref().unwrap(),
+                &run_dir.join(format!("{index:06}.stdout"))
+            );
+            assert_eq!(
+                record.stderr_path.as_ref().unwrap(),
+                &run_dir.join(format!("{index:06}.stderr"))
+            );
+        }
+    }
+    assert!(
+        fs::read_to_string(first.commands[0].stdout_path.as_ref().unwrap())
+            .unwrap()
+            .ends_with("first\n")
+    );
+}
+
+#[test]
+fn omitted_output_directory_keeps_logs_outside_the_working_directory() {
+    let dir = tempdir().unwrap();
+    let mut value = request(dir.path(), vec![command("empty", &["stdin"])]);
+    value.as_object_mut().unwrap().remove("output_directory");
+    let result = run_value(value);
+    assert_eq!(result.status, Status::Passed);
+    let logs = result.output_directory.unwrap();
+    assert!(logs.is_absolute() && logs.is_dir());
+    assert!(!logs.starts_with(dir.path().canonicalize().unwrap()));
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    fs::remove_dir_all(logs).unwrap();
+}
+
+#[test]
+fn invalid_output_directory_is_rejected_without_side_effects() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("file"), "content").unwrap();
+    for parent in [
+        PathBuf::from("relative"),
+        dir.path().join("missing"),
+        dir.path().join("file"),
+    ] {
+        let mut value = request(
+            dir.path(),
+            vec![command("unused", &["record", "journal", "unused", "0"])],
+        );
+        value["output_directory"] = json!(parent);
+        let result = run_value(value);
+        assert_eq!(result.status, Status::Blocked);
+        assert_eq!(result.phase, "input");
+        assert!(result.commands.is_empty() && result.output_directory.is_none());
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn unavailable_default_log_directory_blocks_before_any_command_runs() {
+    let dir = tempdir().unwrap();
+    let request_file = dir.path().join("request.json");
+    let mut value = request(
+        dir.path(),
+        vec![command("unused", &["record", "journal", "unused", "0"])],
+    );
+    value.as_object_mut().unwrap().remove("output_directory");
+    fs::write(&request_file, serde_json::to_vec(&value).unwrap()).unwrap();
+    let missing = dir.path().join("missing");
+    let output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["run", "--request"])
+        .arg(request_file)
+        .env("TMPDIR", &missing)
+        .env("TMP", &missing)
+        .env("TEMP", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "BLOCKED");
+    assert_eq!(result["phase"], "output");
+    assert_eq!(result["commands"], json!([]));
+    assert!(!dir.path().join("journal").exists());
+}
+
+#[test]
+fn log_file_creation_failure_retains_prior_results_and_never_overwrites() {
+    let dir = tempdir().unwrap();
+    let logs = tempdir().unwrap();
+    let mut value = request(
+        dir.path(),
+        vec![
+            command("first", &["block-next-log", logs.path().to_str().unwrap()]),
+            command("blocked", &["record", "journal", "must-not-run", "0"]),
+            command("skipped", &["record", "journal", "must-not-run", "0"]),
+        ],
+    );
+    value["output_directory"] = json!(logs.path());
+    let result = run_value(value);
+    assert_eq!(result.status, Status::Blocked);
+    assert_eq!(result.phase, "commands");
+    assert_eq!(result.failed_command_index, Some(1));
+    assert_eq!(result.commands.len(), 2);
+    assert_eq!(result.commands[0].status, Status::Passed);
+    assert_eq!(result.commands[1].exit_code, None);
+    assert!(result.commands[1].stdout_path.as_ref().unwrap().is_file());
+    assert!(result.commands[1].stderr_path.is_none());
+    assert!(result.error.unwrap().contains("Cannot create stderr log"));
+    assert_eq!(
+        fs::read_to_string(result.output_directory.unwrap().join("000001.stderr")).unwrap(),
+        "do not overwrite"
+    );
+    assert!(!dir.path().join("journal").exists());
 }
 
 #[test]
@@ -374,6 +600,33 @@ fn cli_reads_request_files_and_returns_json_for_read_or_parse_errors() {
             .unwrap()
             .contains("Cannot read request")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_log_stops_the_sequence_even_if_the_child_succeeded() {
+    let dir = tempdir().unwrap();
+    let logs = tempdir().unwrap();
+    let mut value = request(
+        dir.path(),
+        vec![
+            command(
+                "remove-log",
+                &["remove-current-stdout", logs.path().to_str().unwrap()],
+            ),
+            command("skipped", &["record", "journal", "must-not-run", "0"]),
+        ],
+    );
+    value["output_directory"] = json!(logs.path());
+    let result = run_value(value);
+    assert_eq!(result.status, Status::Blocked);
+    assert_eq!(result.failed_command_index, Some(0));
+    assert_eq!(result.commands.len(), 1);
+    assert_eq!(result.commands[0].exit_code, Some(0));
+    assert_eq!(result.commands[0].status, Status::Blocked);
+    assert!(result.error.unwrap().contains("Cannot read stdout log"));
+    assert!(result.commands[0].stderr_path.as_ref().unwrap().is_file());
+    assert!(!dir.path().join("journal").exists());
 }
 
 #[cfg(unix)]
